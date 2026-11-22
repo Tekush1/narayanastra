@@ -1,0 +1,19 @@
+#[cfg(target_os = "linux")]
+pub mod rootkit;
+#[cfg(target_os = "linux")]
+pub mod process;
+#[cfg(target_os = "linux")]
+pub mod network;
+#[cfg(target_os = "linux")]
+pub mod files;
+#[cfg(target_os = "linux")]
+pub mod memory;
+#[cfg(target_os = "linux")]
+pub mod logs;
+#[cfg(target_os = "linux")]
+pub mod antiforensics;
+#[cfg(target_os = "linux")]
+pub mod offline;
+
+#[cfg(target_os = "windows")]
+pub mod windows;

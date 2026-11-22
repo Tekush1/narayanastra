@@ -1,0 +1,6 @@
+/target
+*.exe
+*.json
+*.txt
+!threat_feeds/*.txt
+Cargo.lock
