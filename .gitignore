@@ -1,6 +1,6 @@
 /target
 *.exe
-*.json
-*.txt
-!threat_feeds/*.txt
-Cargo.lock
+narayanastra-*/
+scan_report.*
+offline_scan_report.*
+remote_scan_*
