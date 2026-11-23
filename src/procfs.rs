@@ -108,8 +108,7 @@ impl MapEntry {
 }
 
 /// Parse one maps line. The path is everything after the 5th field (it may contain
-/// spaces) and a trailing " (deleted)" is split off. The old parser used only the 6th
-/// whitespace token, so its "(deleted)" check could never fire.
+/// spaces) and a trailing " (deleted)" marker is split off into its own flag.
 pub fn parse_maps_line(line: &str) -> Option<MapEntry> {
     let mut rest = line;
     let mut fields = Vec::with_capacity(5);

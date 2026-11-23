@@ -17,8 +17,7 @@ fn progress(tx: &Sender, msg: &str) {
 
 const SHELLS: [&str; 8] = ["bash", "sh", "zsh", "dash", "fish", "ksh", "csh", "ash"];
 
-/// Real regexes now — the old code passed these to str::contains(), so half of them
-/// ("python -c.*import.*socket" ...) could never match anything.
+/// Reverse-shell command-line patterns, compiled once as a case-insensitive RegexSet.
 pub const REVSHELL_PATTERNS: [&str; 14] = [
     r"/dev/(tcp|udp)/",
     r"\bbash\s+-i\b.*[>&]",

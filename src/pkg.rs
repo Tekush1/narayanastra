@@ -3,8 +3,8 @@
 //!
 //! dpkg is verified natively (we parse info/*.md5sums and hash files ourselves) so a
 //! trojaned /usr/bin/dpkg on the live host cannot lie to us. "Unknown" (no package
-//! manager) is never treated as "not owned" — that bug made every Fedora box report a
-//! PAM backdoor.
+//! manager) is never treated as "not owned", so hosts without a supported package
+//! manager do not produce ownership-based false positives.
 
 use crate::hash;
 use crate::util::{self, Root};

@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Truncate on a char boundary (the old byte-slicing version panicked on UTF-8).
+/// Truncate to `max_chars` characters, always on a UTF-8 character boundary.
 pub fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -234,7 +234,7 @@ fn reader_thread<R: Read + Send + 'static>(mut r: R, cap: usize) -> std::thread:
 }
 
 /// Run a command by absolute path with a cleared environment, a hard timeout and
-/// concurrent stdout/stderr draining (the old code deadlocked once output exceeded 64KB).
+/// concurrent stdout/stderr draining so a child producing large output can never block.
 pub fn run_cmd(candidates: &[&str], args: &[&str], timeout: Duration, out_cap: usize, stdin_data: Option<Vec<u8>>) -> Option<CmdOut> {
     let bin = find_bin(candidates)?;
     let mut cmd = Command::new(&bin);
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn cmd_runner_drains_large_output() {
-        // > 64KB of output used to deadlock the old dpkg --verify loop
+        // output larger than the 64KB pipe buffer must be drained while waiting
         if let Some(out) = run_cmd(&["/usr/bin/head", "/bin/head"], &["-c", "500000", "/dev/zero"], Duration::from_secs(10), 10 * 1024 * 1024, None) {
             assert!(!out.timed_out);
             assert_eq!(out.stdout.len(), 500000);

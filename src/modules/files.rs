@@ -12,8 +12,8 @@ fn progress(tx: &Sender, msg: &str) {
     prog(tx, MODULE, msg)
 }
 
-/// SUID/SGID: no basename whitelist any more (a backdoor named "passwd" used to skip
-/// every check). Ownership by a package decides; temp/home locations are always bad.
+/// SUID/SGID scan. Files are judged by package ownership rather than by name, so a
+/// backdoor cannot hide behind a familiar basename; temp/home locations are always flagged.
 fn suid_sgid_scan(cfg: &ScanConfig, tx: &Sender) {
     progress(tx, "Scanning for SUID/SGID binaries (package ownership based)...");
     let root = Root::live();

@@ -11,9 +11,9 @@ fn progress(tx: &Sender, msg: &str) {
     prog(tx, MODULE, msg)
 }
 
-/// Libraries that really contain a JIT. libpcre2-8 and libpython were removed: almost
-/// every daemon loads libpcre2-8 (via libselinux), which silently whitelisted sshd and
-/// systemd from injection detection.
+/// Libraries that embed a real JIT engine. General-purpose libraries loaded by most
+/// daemons (e.g. libpcre2-8 via libselinux) are deliberately excluded so that common
+/// daemons such as sshd and systemd are never exempted from injection detection.
 const JIT_LIBS: [&str; 15] = [
     "libv8",
     "v8_context_snapshot",

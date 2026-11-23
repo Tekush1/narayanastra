@@ -18,7 +18,7 @@ fn owner_str(map: &HashMap<u64, (u32, String)>, inode: u64) -> String {
 
 /// /proc/net (seq_file) vs netlink sock_diag, in BOTH directions, TCP and UDP, v4 and v6.
 /// Rootkits that hook tcp4_seq_show hide from /proc/net/tcp while netlink still sees the
-/// socket — the old code only checked the opposite direction, so it missed exactly that.
+/// socket, so both directions of the comparison are reported.
 fn cross_view(tx: &Sender, proc_view: &[Conn], nl_view: Option<&Vec<Conn>>, owners: &HashMap<u64, (u32, String)>) {
     progress(tx, "Cross-checking sockets: netlink sock_diag vs /proc/net/{tcp,udp}{,6}...");
     let nl = match nl_view {

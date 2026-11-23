@@ -85,7 +85,7 @@ fn auth_log_analysis(cfg: &ScanConfig, tx: &Sender) {
 }
 
 /// Parse a syslog timestamp ("Nov 22 14:30:01" or RFC3339) into a sortable value.
-/// The old code compared strings, so every Dec→Jan / Nov→Dec rollover looked like tampering.
+/// Timestamps are compared numerically so month and year rollovers are not mistaken for tampering.
 pub fn parse_ts(line: &str) -> Option<i64> {
     if line.len() >= 19 && line.as_bytes()[4] == b'-' && line.as_bytes()[10] == b'T' {
         let dt = chrono::NaiveDateTime::parse_from_str(&line[..19], "%Y-%m-%dT%H:%M:%S").ok()?;
