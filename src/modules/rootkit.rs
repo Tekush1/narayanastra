@@ -1,284 +1,355 @@
-use crate::report::{Finding, ScanEvent, Sender, Severity};
+//! Cross-view rootkit detection: compare what the kernel *does* (syscall probes) with
+//! what it *reports* (/proc listings, module lists, kallsyms).
+
+use crate::config::ScanConfig;
+use crate::pkg::{self, Ownership};
+use crate::procfs;
+use crate::report::{progress as prog, send, Finding, ScanEvent, Sender, Severity};
+use crate::util::{self, Root};
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
-use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MODULE: &str = "ROOTKIT";
 
-fn send(tx: &Sender, finding: Finding) {
-    let _ = tx.send(ScanEvent::Finding(finding));
-}
-
 fn progress(tx: &Sender, msg: &str) {
-    let _ = tx.send(ScanEvent::ModuleProgress(MODULE.to_string(), msg.to_string()));
+    prog(tx, MODULE, msg)
 }
 
-fn hidden_pids(tx: &Sender) {
-    progress(tx, "Checking for hidden PIDs (/proc vs ps)...");
-
-    // Get PIDs from /proc
-    let mut proc_pids = HashSet::new();
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if let Ok(pid) = name.parse::<u32>() {
-                    proc_pids.insert(pid);
-                }
+/// Does `pid` exist according to direct syscalls (not directory listings)?
+fn pid_alive(pid: u32, thorough: bool) -> bool {
+    let p = pid as libc::pid_t;
+    unsafe {
+        let r = libc::kill(p, 0);
+        if r == 0 || *libc::__errno_location() == libc::EPERM {
+            return true;
+        }
+        if thorough {
+            if libc::getpgid(p) >= 0 || libc::getsid(p) >= 0 {
+                return true;
+            }
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(p, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+                return true;
             }
         }
     }
+    std::path::Path::new(&format!("/proc/{}/status", pid)).exists()
+}
 
-    // Get PIDs from ps
-    let mut ps_pids = HashSet::new();
-    if let Ok(output) = Command::new("ps").args(["-eo", "pid"]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines().skip(1) {
-            if let Ok(pid) = line.trim().parse::<u32>() {
-                ps_pids.insert(pid);
+fn listed_pids_and_tids() -> (HashSet<u32>, HashSet<u32>) {
+    let pids: HashSet<u32> = util::proc_pids().into_iter().collect();
+    let mut tids = HashSet::new();
+    for pid in &pids {
+        for t in util::list_dir_raw(&format!("/proc/{}/task", pid)).unwrap_or_default() {
+            if let Ok(t) = t.parse::<u32>() {
+                tids.insert(t);
             }
         }
     }
+    (pids, tids)
+}
 
-    // PIDs in /proc but NOT in ps = possibly hidden by rootkit
-    let hidden: Vec<u32> = proc_pids.difference(&ps_pids).copied().collect();
-    // PIDs in ps but NOT in /proc = extremely suspicious
-    let ghost: Vec<u32> = ps_pids.difference(&proc_pids).copied().collect();
+/// Hidden process detection by PID brute force (unhide-style):
+/// probe every PID with kill(0)/getpgid/getsid/sched_getaffinity and compare against the
+/// raw getdents64 listing of /proc. A getdents-hooking rootkit (Diamorphine, Reptile...)
+/// removes the PID from the listing but the process still answers syscalls.
+fn hidden_pids(cfg: &ScanConfig, tx: &Sender) {
+    let pid_max: u32 = util::read_proc("/proc/sys/kernel/pid_max").and_then(|s| s.trim().parse().ok()).unwrap_or(32768).min(4_194_304);
+    let (listed, tids) = listed_pids_and_tids();
+    let highest = listed.iter().copied().max().unwrap_or(1);
+    // quick mode: up to 2x the highest visible PID (min 65536); --full: whole pid space
+    let limit = if cfg.full { pid_max } else { (highest.saturating_mul(2)).max(65536).min(pid_max) };
+    progress(tx, &format!("Brute-forcing PIDs 1..{} against /proc listing...", limit));
 
-    if !hidden.is_empty() {
-        // Some difference is normal (race condition), but large numbers are suspicious
-        if hidden.len() > 10 {
-            send(tx, Finding::new(Severity::Warning, MODULE, "Hidden PIDs",
-                &format!("{} PIDs in /proc but not in ps output — possible rootkit process hiding", hidden.len()))
-                .with_detail(&format!("Sample PIDs: {:?}", &hidden[..std::cmp::min(20, hidden.len())])));
+    let mut candidates: Vec<u32> = (1..=limit).filter(|p| !listed.contains(p) && !tids.contains(p)).filter(|&p| pid_alive(p, cfg.full)).collect();
+
+    // re-check twice to rule out processes that started/exited mid-scan
+    for _ in 0..2 {
+        if candidates.is_empty() {
+            break;
         }
+        std::thread::sleep(Duration::from_millis(50));
+        let (listed2, tids2) = listed_pids_and_tids();
+        candidates.retain(|p| !listed2.contains(p) && !tids2.contains(p) && pid_alive(*p, true));
     }
+    // a TID of a visible process is not a hidden process
+    candidates.retain(|p| {
+        let st = procfs::status_fields(*p);
+        match st.get("Tgid").and_then(|t| t.parse::<u32>().ok()) {
+            Some(tgid) if tgid != *p => !listed.contains(&tgid),
+            _ => true,
+        }
+    });
 
-    if ghost.len() > 5 {
-        // A few ghost PIDs are normal (race condition between ps and /proc reads)
-        // Large numbers indicate actual /proc manipulation
-        send(tx, Finding::new(Severity::Danger, MODULE, "Ghost PIDs",
-            &format!("{} PIDs in ps but missing from /proc — rootkit may be manipulating /proc", ghost.len()))
-            .with_detail(&format!("PIDs: {:?}", ghost)));
-    } else if !ghost.is_empty() {
-        send(tx, Finding::new(Severity::Info, MODULE, "PID Race",
-            &format!("{} PIDs in ps but not in /proc (normal race condition)", ghost.len())));
+    if candidates.is_empty() {
+        send(
+            tx,
+            Finding::new(Severity::Safe, MODULE, "PID Check", &format!("No hidden processes ({} PIDs listed, {} probed)", listed.len(), limit))
+                .subject("pid-check"),
+        );
+        return;
     }
-
-    if hidden.len() <= 10 && ghost.is_empty() {
-        send(tx, Finding::new(Severity::Safe, MODULE, "PID Check",
-            &format!("No hidden processes ({} /proc PIDs, {} ps PIDs)", proc_pids.len(), ps_pids.len())));
+    for pid in candidates {
+        let info = procfs::read_proc_info(pid);
+        let detail = match &info {
+            Some(i) => format!("Name: {}\nExe: {}\nCmdline: {}\nPPid: {}  Uid: {}", i.name, i.exe, i.cmdline, i.ppid, i.uid),
+            None => "Process answers syscalls but /proc/<pid> details are also hidden".to_string(),
+        };
+        let mut f =
+            Finding::new(Severity::Danger, MODULE, "Hidden PIDs", &format!("PID {} is alive but hidden from the /proc listing — rootkit process hiding", pid))
+                .with_detail(&detail)
+                .subject(&format!("pid:{}", pid));
+        if let Some(i) = info {
+            if !i.exe.is_empty() {
+                f = f.artifact(&format!("/proc/{}/exe", pid));
+            }
+        }
+        send(tx, f);
     }
 }
 
 fn deleted_binaries(tx: &Sender) {
-    progress(tx, "Checking for processes running deleted binaries...");
-
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.parse::<u32>().is_err() {
-                continue;
-            }
-
-            let exe_link = format!("/proc/{}/exe", name);
-            if let Ok(target) = fs::read_link(&exe_link) {
-                let target_str = target.to_string_lossy().to_string();
-                if target_str.contains("(deleted)") {
-                    let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", name))
-                        .unwrap_or_default()
-                        .replace('\0', " ");
-
-                    send(tx, Finding::new(Severity::Danger, MODULE, "Deleted Binary",
-                        &format!("PID {} running deleted binary: {}", name, target_str))
-                        .with_detail(&format!("Cmdline: {}", cmdline.trim())));
-                }
-            }
+    progress(tx, "Checking for processes running deleted or memfd binaries...");
+    let root = Root::live();
+    for pid in util::proc_pids() {
+        let (exe, deleted) = procfs::exe(pid);
+        if exe.is_empty() {
+            continue;
+        }
+        let cmd = procfs::read_cmdline(pid);
+        if exe.starts_with("/memfd:") {
+            send(
+                tx,
+                Finding::new(Severity::Danger, MODULE, "Memfd Exec", &format!("PID {} executes from an anonymous memfd: {}", pid, exe))
+                    .with_detail(&format!("Fileless execution (memfd_create + fexecve)\nCmdline: {}", cmd))
+                    .subject(&format!("pid:{}", pid))
+                    .artifact(&format!("/proc/{}/exe", pid)),
+            );
+            continue;
+        }
+        if !deleted {
+            continue;
+        }
+        // Binary replaced by a package upgrade: path exists again and is package-owned.
+        let replaced = fs::metadata(&exe).is_ok() && pkg::owner(&root, &exe) == Ownership::Owned;
+        if replaced {
+            send(
+                tx,
+                Finding::new(Severity::Info, MODULE, "Deleted Binary", &format!("PID {} runs an old copy of {} (upgraded since start)", pid, exe))
+                    .with_detail("Normal after package upgrades — restart the service to load the new binary")
+                    .subject(&format!("pid:{}", pid)),
+            );
+        } else {
+            let sev = if util::is_temp_path(&exe) || util::has_hidden_component(&exe) { Severity::Danger } else { Severity::Warning };
+            send(
+                tx,
+                Finding::new(sev, MODULE, "Deleted Binary", &format!("PID {} runs a deleted binary: {}", pid, exe))
+                    .with_detail(&format!("Cmdline: {}\nThe file is gone from disk — common for dropped malware", cmd))
+                    .subject(&format!("pid:{}", pid))
+                    .artifact(&format!("/proc/{}/exe", pid)),
+            );
         }
     }
 }
 
 fn ld_preload_check(tx: &Sender) {
-    progress(tx, "Checking LD_PRELOAD across all processes...");
-
-    // Global ld.so.preload
-    if let Ok(content) = fs::read_to_string("/etc/ld.so.preload") {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            send(tx, Finding::new(Severity::Danger, MODULE, "LD Preload",
-                "ld.so.preload has entries — global library injection active")
-                .with_detail(&format!("Libraries: {}", trimmed)));
-        }
-    }
-
-    // Check LD_PRELOAD in each process's environment
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.parse::<u32>().is_err() {
-                continue;
-            }
-
-            let environ_path = format!("/proc/{}/environ", name);
-            if let Ok(data) = fs::read(&environ_path) {
-                let environ = String::from_utf8_lossy(&data);
-                for var in environ.split('\0') {
-                    if var.starts_with("LD_PRELOAD=") {
-                        let value = &var[11..];
-                        if !value.is_empty() {
-                            let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", name))
-                                .unwrap_or_default()
-                                .replace('\0', " ");
-                            send(tx, Finding::new(Severity::Danger, MODULE, "LD_PRELOAD",
-                                &format!("PID {} has LD_PRELOAD set: {}", name, value))
-                                .with_detail(&format!("Process: {}", cmdline.trim())));
-                        }
+    progress(tx, "Checking LD_PRELOAD / LD_AUDIT in every process environment...");
+    let root = Root::live();
+    for pid in util::proc_pids() {
+        let data = match util::read_proc_bytes(format!("/proc/{}/environ", pid)) {
+            Some(d) => d,
+            None => continue,
+        };
+        for var in data.split(|&b| b == 0) {
+            let var = String::from_utf8_lossy(var);
+            for key in ["LD_PRELOAD=", "LD_AUDIT="] {
+                if let Some(value) = var.strip_prefix(key) {
+                    if value.trim().is_empty() {
+                        continue;
                     }
+                    let libs: Vec<&str> = value.split([':', ' ']).filter(|s| !s.is_empty()).collect();
+                    let bad = libs.iter().any(|l| util::is_temp_path(l) || util::has_hidden_component(l) || pkg::owner(&root, l) == Ownership::NotOwned);
+                    let sev = if bad || key == "LD_AUDIT=" { Severity::Danger } else { Severity::Warning };
+                    let cat = if key == "LD_AUDIT=" { "LD_AUDIT" } else { "LD_PRELOAD" };
+                    send(
+                        tx,
+                        Finding::new(sev, MODULE, cat, &format!("PID {} ({}) has {}{}", pid, procfs::comm(pid), key, value))
+                            .with_detail(&format!(
+                                "Process: {}\n{}",
+                                procfs::read_cmdline(pid),
+                                if bad {
+                                    "Library is outside any package or in a temp/hidden path"
+                                } else {
+                                    "Library is package-owned (could be jemalloc/gtk-nocsd) — verify"
+                                }
+                            ))
+                            .subject(&format!("pid:{}:{}", pid, cat)),
+                    );
                 }
             }
         }
     }
 }
 
-fn hidden_kernel_modules(tx: &Sender) {
-    progress(tx, "Checking for hidden kernel modules...");
+fn hidden_kernel_modules(cfg: &ScanConfig, tx: &Sender) {
+    progress(tx, "Cross-checking kernel modules (/proc/modules vs /sys/module vs kallsyms)...");
+    let proc_modules: HashSet<String> =
+        util::read_proc("/proc/modules").map(|c| c.lines().filter_map(|l| l.split_whitespace().next().map(String::from)).collect()).unwrap_or_default();
 
-    // /proc/modules vs /sys/module
-    let mut proc_modules = HashSet::new();
-    if let Ok(content) = fs::read_to_string("/proc/modules") {
-        for line in content.lines() {
-            if let Some(name) = line.split_whitespace().next() {
-                proc_modules.insert(name.to_string());
+    // loadable modules expose /sys/module/<m>/initstate; built-ins do not
+    let mut hidden = Vec::new();
+    for m in util::list_dir_raw("/sys/module").unwrap_or_default() {
+        if std::path::Path::new(&format!("/sys/module/{}/initstate", m)).exists() && !proc_modules.contains(&m) {
+            hidden.push(m);
+        }
+    }
+    for m in &hidden {
+        send(
+            tx,
+            Finding::new(Severity::Danger, MODULE, "Hidden Module", &format!("Kernel module '{}' is loaded (sysfs) but hidden from /proc/modules", m))
+                .with_detail("Rootkits unlink themselves from the module list (list_del) to disappear from lsmod")
+                .subject(&format!("module:{}", m)),
+        );
+    }
+
+    // kallsyms owners: symbols tagged [mod] whose module isn't listed
+    if cfg.is_root {
+        if let Some(ks) = util::read_proc("/proc/kallsyms") {
+            let mut owners: HashSet<String> = HashSet::new();
+            for line in ks.lines() {
+                if let Some(start) = line.rfind('[') {
+                    if line.ends_with(']') {
+                        owners.insert(line[start + 1..line.len() - 1].to_string());
+                    }
+                }
+            }
+            for o in owners {
+                let pseudo = o.starts_with("__builtin") || o == "bpf" || o == "kprobes" || o == "ftrace" || o.starts_with("bpf_");
+                if !pseudo && !proc_modules.contains(&o) && !hidden.contains(&o) {
+                    send(
+                        tx,
+                        Finding::new(
+                            Severity::Danger,
+                            MODULE,
+                            "Hidden Module",
+                            &format!("kallsyms has symbols from module '{}' that is not in /proc/modules", o),
+                        )
+                        .with_detail("The module's code is resident in the kernel but it removed itself from the module list")
+                        .subject(&format!("module:{}", o)),
+                    );
+                }
             }
         }
     }
 
-    let mut sys_modules = HashSet::new();
-    if let Ok(entries) = fs::read_dir("/sys/module") {
-        for entry in entries.flatten() {
-            sys_modules.insert(entry.file_name().to_string_lossy().to_string());
-        }
+    if hidden.is_empty() {
+        send(
+            tx,
+            Finding::new(Severity::Safe, MODULE, "Kernel Modules", &format!("{} loaded modules, none hidden from /proc/modules", proc_modules.len()))
+                .subject("modules"),
+        );
     }
 
-    // Modules in /sys/module but NOT in /proc/modules could be hidden
-    let hidden: Vec<&String> = sys_modules.difference(&proc_modules)
-        .filter(|m| {
-            // Some builtin modules appear in /sys/module but not /proc/modules — filter those
-            let params = format!("/sys/module/{}/parameters", m);
-            let sections = format!("/sys/module/{}/sections", m);
-            Path::new(&sections).exists() || Path::new(&params).exists()
-        })
-        .collect();
-
-    // Known rootkit module names
-    let rootkit_names = ["diamorphine", "reptile", "bdvl", "jynx", "suterusu",
-        "knark", "adore", "enyelkm", "azazel", "brootus", "nurupo",
-        "khugepagefs", "kovid", "beurk", "vlany", "libprocesshider"];
-
-    for module in proc_modules.iter().chain(sys_modules.iter()) {
-        let lower = module.to_lowercase();
-        for rk in &rootkit_names {
-            if lower.contains(rk) {
-                send(tx, Finding::new(Severity::Danger, MODULE, "Rootkit Module",
-                    &format!("Known rootkit kernel module: {}", module)));
-            }
+    // Signature check (kept separate from behaviour checks, so the README stays honest)
+    let rootkit_names = [
+        "diamorphine",
+        "reptile",
+        "bdvl",
+        "jynx",
+        "suterusu",
+        "knark",
+        "adore",
+        "enyelkm",
+        "azazel",
+        "brootus",
+        "nurupo",
+        "khugepagefs",
+        "kovid",
+        "beurk",
+        "vlany",
+        "singularity",
+        "puszek",
+        "rkduck",
+        "sutekh",
+    ];
+    let mut all: HashSet<&String> = proc_modules.iter().collect();
+    all.extend(hidden.iter());
+    for m in all {
+        let lower = m.to_lowercase();
+        if let Some(rk) = rootkit_names.iter().find(|rk| lower.contains(*rk)) {
+            send(
+                tx,
+                Finding::new(Severity::Danger, MODULE, "Rootkit Signature", &format!("Kernel module '{}' matches known rootkit '{}'", m, rk))
+                    .subject(&format!("sig:{}", m)),
+            );
         }
-    }
-
-    if !hidden.is_empty() && hidden.len() > 5 {
-        send(tx, Finding::new(Severity::Info, MODULE, "Kernel Modules",
-            &format!("{} in /proc/modules, {} in /sys/module ({} only in /sys)",
-                proc_modules.len(), sys_modules.len(), hidden.len())));
     }
 }
 
-fn suspicious_kernel_state(tx: &Sender) {
-    progress(tx, "Checking kernel taint and integrity flags...");
-
-    // Check kernel taint flags
-    if let Ok(taint) = fs::read_to_string("/proc/sys/kernel/tainted") {
-        if let Ok(val) = taint.trim().parse::<u64>() {
-            if val != 0 {
-                let mut reasons = Vec::new();
-                if val & 1 != 0 { reasons.push("proprietary module loaded"); }
-                if val & 2 != 0 { reasons.push("module force loaded"); }
-                if val & 4 != 0 { reasons.push("SMP kernel on non-SMP"); }
-                if val & 8 != 0 { reasons.push("module force unloaded"); }
-                if val & 16 != 0 { reasons.push("MCE occurred"); }
-                if val & 32 != 0 { reasons.push("bad page found"); }
-                if val & 64 != 0 { reasons.push("userspace taint requested"); }
-                if val & 128 != 0 { reasons.push("kernel died/OOPS"); }
-                if val & 256 != 0 { reasons.push("ACPI overridden"); }
-                if val & 512 != 0 { reasons.push("warning occurred"); }
-                if val & 4096 != 0 { reasons.push("out-of-tree module loaded"); }
-                if val & 8192 != 0 { reasons.push("unsigned module loaded"); }
-
-                let sev = if val & 8192 != 0 { Severity::Warning } else { Severity::Info };
-                send(tx, Finding::new(sev, MODULE, "Kernel Taint",
-                    &format!("Kernel tainted (flags={}): {}", val, reasons.join(", "))));
-            }
-        }
-    }
-
-    // Check if kprobes is active (could indicate monitoring/hooking)
-    if let Ok(content) = fs::read_to_string("/sys/kernel/debug/kprobes/list") {
-        let count = content.lines().count();
-        if count > 0 {
-            send(tx, Finding::new(Severity::Info, MODULE, "Kprobes",
-                &format!("{} active kprobes — could be legitimate monitoring or rootkit hooks", count)));
-        }
-    }
-}
-
-fn check_proc_anomalies(tx: &Sender) {
+fn check_proc_anomalies(cfg: &ScanConfig, tx: &Sender) {
     progress(tx, "Checking /proc for anomalies...");
-
-    // Check if /proc is mounted with hidepid
-    if let Ok(content) = fs::read_to_string("/proc/mounts") {
+    if let Some(content) = util::read_proc("/proc/mounts") {
         for line in content.lines() {
-            if line.starts_with("proc /proc") && line.contains("hidepid=") {
-                send(tx, Finding::new(Severity::Info, MODULE, "Proc Mount",
-                    &format!("proc mounted with hidepid: {}", line.trim())));
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() >= 4 && f[1] == "/proc" && f[3].contains("hidepid=") {
+                send(
+                    tx,
+                    Finding::new(Severity::Info, MODULE, "Proc Mount", &format!("/proc mounted with hidepid ({}) — non-root views are limited", f[3]))
+                        .subject("hidepid"),
+                );
+            }
+            // something mounted over a /proc/<pid> directory hides that process
+            if f.len() >= 2 {
+                if let Some(rest) = f[1].strip_prefix("/proc/") {
+                    if rest.split('/').next().map(|p| p.parse::<u32>().is_ok()).unwrap_or(false) {
+                        send(
+                            tx,
+                            Finding::new(
+                                Severity::Danger,
+                                MODULE,
+                                "Hidden Process",
+                                &format!("A filesystem is mounted over {} — classic process-hiding trick", f[1]),
+                            )
+                            .with_detail(line)
+                            .subject(&format!("mount:{}", f[1])),
+                        );
+                    }
+                }
             }
         }
     }
-
-    // Check for /proc/PID directories we can't read (may be cloaked)
-    let mut unreadable = 0;
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.parse::<u32>().is_err() {
-                continue;
-            }
-            let status = format!("/proc/{}/status", name);
-            if Path::new(&status).exists() && fs::read_to_string(&status).is_err() {
-                unreadable += 1;
+    if cfg.is_root {
+        let mut unreadable = Vec::new();
+        for pid in util::proc_pids() {
+            let status = format!("/proc/{}/status", pid);
+            if std::path::Path::new(&status).exists() && util::read_proc(&status).is_none() {
+                unreadable.push(pid);
             }
         }
-    }
-
-    if unreadable > 0 {
-        send(tx, Finding::new(Severity::Info, MODULE, "Proc Access",
-            &format!("{} process(es) with unreadable /proc/PID/status", unreadable)));
+        if !unreadable.is_empty() {
+            send(
+                tx,
+                Finding::new(
+                    Severity::Warning,
+                    MODULE,
+                    "Hidden Process",
+                    &format!("{} process(es) have /proc entries that even root cannot read", unreadable.len()),
+                )
+                .with_detail(&format!("PIDs: {:?}", &unreadable[..unreadable.len().min(20)]))
+                .subject("proc-unreadable"),
+            );
+        }
     }
 }
 
-pub fn scan(is_root: bool, tx: Sender) {
+pub fn scan(cfg: &ScanConfig, tx: Sender) {
     let start = Instant::now();
     let _ = tx.send(ScanEvent::ModuleStart(MODULE.to_string()));
-
-    hidden_pids(&tx);
+    hidden_pids(cfg, &tx);
     deleted_binaries(&tx);
     ld_preload_check(&tx);
-    hidden_kernel_modules(&tx);
-
-    if is_root {
-        suspicious_kernel_state(&tx);
-    }
-
-    check_proc_anomalies(&tx);
-
+    hidden_kernel_modules(cfg, &tx);
+    check_proc_anomalies(cfg, &tx);
     let _ = tx.send(ScanEvent::ModuleDone(MODULE.to_string(), start.elapsed()));
 }

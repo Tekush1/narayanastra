@@ -1,326 +1,244 @@
-use crate::report::{Finding, ScanEvent, Sender, Severity};
-use std::fs;
+use crate::config::ScanConfig;
+use crate::procfs::{self, MapEntry};
+use crate::report::{progress as prog, send, Finding, ScanEvent, Sender, Severity};
+use crate::util;
+use std::io::Read;
 use std::time::Instant;
 
 const MODULE: &str = "MEMORY";
 
-fn send(tx: &Sender, finding: Finding) {
-    let _ = tx.send(ScanEvent::Finding(finding));
-}
-
 fn progress(tx: &Sender, msg: &str) {
-    let _ = tx.send(ScanEvent::ModuleProgress(MODULE.to_string(), msg.to_string()));
+    prog(tx, MODULE, msg)
 }
 
-fn process_has_jit_library(pid: &str, maps_content: &str) -> bool {
-    // Detect JIT engines by their loaded .so libraries — works for ANY app
-    let jit_libraries = [
-        // V8 (Chrome, Node, Electron, Deno, any Electron app)
-        "libv8", "v8_context_snapshot",
-        // SpiderMonkey (Firefox, gjs/GNOME apps)
-        "libmozjs", "libgjs",
-        // JavaScriptCore (WebKit, Safari, Epiphany)
-        "libjavascriptcore", "libwebkit",
-        // Java/JVM
-        "libjvm", "libjava", "libjli",
-        // .NET/Mono
-        "libcoreclr", "libmono",
-        // LuaJIT
-        "libluajit",
-        // QEMU/emulators
-        "libtcg",
-        // WASM runtimes
-        "libwasmtime", "libwasmer",
-        // Python JIT (3.13+)
-        "libpython",
-        // PCRE JIT
-        "libpcre2-8",
-    ];
+/// Libraries that really contain a JIT. libpcre2-8 and libpython were removed: almost
+/// every daemon loads libpcre2-8 (via libselinux), which silently whitelisted sshd and
+/// systemd from injection detection.
+const JIT_LIBS: [&str; 15] = [
+    "libv8",
+    "v8_context_snapshot",
+    "libnode",
+    "libmozjs",
+    "libxul.so",
+    "libjavascriptcoregtk",
+    "libwebkit2gtk",
+    "libjvm",
+    "libcoreclr",
+    "libclrjit",
+    "libmonosgen",
+    "libluajit",
+    "libwasmtime",
+    "libwasmer",
+    "libqemu",
+];
 
-    for line in maps_content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
+/// Common daemons that never JIT — RWX memory there is a strong injection signal.
+const NON_JIT_DAEMONS: [&str; 16] = [
+    "sshd",
+    "sshd-session",
+    "systemd",
+    "cron",
+    "crond",
+    "bash",
+    "sh",
+    "dash",
+    "dbus-daemon",
+    "rsyslogd",
+    "systemd-journal",
+    "systemd-logind",
+    "nginx",
+    "apache2",
+    "httpd",
+    "sudo",
+];
+
+fn has_jit_engine(pid: u32, maps: &[MapEntry]) -> bool {
+    if maps.iter().any(|m| {
+        let file = m.path.rsplit('/').next().unwrap_or("").to_lowercase();
+        JIT_LIBS.iter().any(|j| file.starts_with(j))
+    }) {
+        return true;
+    }
+    // statically linked engines (Electron, node): scan at most 2MB of the binary
+    let (exe, deleted) = procfs::exe(pid);
+    if exe.is_empty() || deleted {
+        return false;
+    }
+    let mut buf = Vec::with_capacity(2 * 1024 * 1024);
+    match std::fs::File::open(&exe) {
+        Ok(f) => {
+            if f.take(2 * 1024 * 1024).read_to_end(&mut buf).is_err() {
+                return false;
+            }
+        }
+        Err(_) => return false,
+    }
+    let needles: [&[u8]; 4] = [b"_ZN2v88internal", b"V8_Fatal", b"_ZN3JSC", b"SpiderMonkey"];
+    needles.iter().any(|n| buf.windows(n.len()).any(|w| w == *n))
+}
+
+fn injection_scan(tx: &Sender) {
+    progress(tx, "Scanning memory maps for injected code (RWX, anon exec, memfd, temp libs)...");
+    let mut flagged = 0usize;
+    for pid in util::proc_pids() {
+        if pid == std::process::id() {
             continue;
         }
-        let mapping = parts[5].to_lowercase();
-        for lib in &jit_libraries {
-            if mapping.contains(lib) {
-                return true;
+        let maps = match procfs::maps(pid) {
+            Some(m) if !m.is_empty() => m,
+            _ => continue,
+        };
+        let name = procfs::comm(pid);
+        let rwx: Vec<&MapEntry> = maps.iter().filter(|m| m.is_write() && m.is_exec() && (m.is_anon() || m.path == "[heap]" || m.path == "[stack]")).collect();
+        let anon_rx: Vec<&MapEntry> = maps.iter().filter(|m| m.is_exec() && !m.is_write() && m.is_anon()).collect();
+        let memfd: Vec<&MapEntry> = maps.iter().filter(|m| m.is_exec() && m.path.starts_with("/memfd:")).collect();
+        // hidden dirs under /home are normal (~/.vscode-server, ~/.cargo, ~/.conda); a hidden
+        // dir under /usr, /lib, /etc, /var is not
+        let in_home = |p: &str| p.starts_with("/home/") || p.starts_with("/root/");
+        let temp_libs: Vec<&MapEntry> = maps
+            .iter()
+            .filter(|m| {
+                m.is_exec()
+                    && !m.path.starts_with("/tmp/.mount_")
+                    && (util::is_temp_path(&m.path) || (util::has_hidden_component(&m.path) && !in_home(&m.path) && !m.path.starts_with("/memfd:")))
+            })
+            .collect();
+        let deleted_libs: Vec<&MapEntry> = maps
+            .iter()
+            .filter(|m| m.is_exec() && m.deleted && !m.path.starts_with("/memfd:") && !m.path.starts_with("/usr/") && !m.path.starts_with("/lib"))
+            .collect();
+
+        let (exe_path, _) = procfs::exe(pid);
+        for m in memfd.iter().filter(|m| m.path != exe_path) {
+            flagged += 1;
+            send(
+                tx,
+                Finding::new(Severity::Danger, MODULE, "Fileless", &format!("PID {} ({}) has executable memfd mapping {}", pid, name, m.path))
+                    .with_detail("Code loaded from an anonymous memory file — fileless malware technique")
+                    .subject(&format!("pid:{}:memfd:{}", pid, m.path)),
+            );
+        }
+        let needs_jit = !temp_libs.is_empty() || !rwx.is_empty() || !anon_rx.is_empty();
+        let jit = needs_jit && has_jit_engine(pid, &maps);
+        for m in &temp_libs {
+            flagged += 1;
+            // JVMs legitimately unpack native libs to /tmp (JNA, Netty, sqlite-jdbc)
+            send(
+                tx,
+                Finding::new(
+                    if jit { Severity::Warning } else { Severity::Danger },
+                    MODULE,
+                    "Injected Library",
+                    &format!("PID {} ({}) maps executable code from {}", pid, name, m.path),
+                )
+                .with_detail(if m.deleted { "Library loaded from a temp/hidden path and then deleted" } else { "Library loaded from a temp/hidden path" })
+                .subject(&format!("pid:{}:lib:{}", pid, m.path))
+                .artifact(&m.path),
+            );
+        }
+        for m in &deleted_libs {
+            flagged += 1;
+            send(
+                tx,
+                Finding::new(Severity::Warning, MODULE, "Deleted Library", &format!("PID {} ({}) runs code from deleted file {}", pid, name, m.path))
+                    .subject(&format!("pid:{}:del:{}", pid, m.path)),
+            );
+        }
+
+        if rwx.is_empty() && anon_rx.is_empty() {
+            continue;
+        }
+        let daemon = NON_JIT_DAEMONS.contains(&name.as_str());
+        let rwx_size: u64 = rwx.iter().map(|m| m.size()).sum();
+        if !rwx.is_empty() {
+            if jit && !daemon {
+                if rwx_size > 512 * 1024 * 1024 {
+                    send(
+                        tx,
+                        Finding::new(
+                            Severity::Info,
+                            MODULE,
+                            "RWX Memory",
+                            &format!("PID {} ({}) JIT engine with {:.0}MB RWX", pid, name, rwx_size as f64 / 1048576.0),
+                        )
+                        .subject(&format!("pid:{}:jit", pid)),
+                    );
+                }
+            } else {
+                flagged += 1;
+                send(
+                    tx,
+                    Finding::new(
+                        if daemon { Severity::Danger } else { Severity::Warning },
+                        MODULE,
+                        "Code Injection",
+                        &format!("PID {} ({}) — {} RWX region(s), {:.1}KB, no JIT engine", pid, name, rwx.len(), rwx_size as f64 / 1024.0),
+                    )
+                    .with_detail(&format!(
+                        "First region: {:x}-{:x} {} {}",
+                        rwx[0].start,
+                        rwx[0].end,
+                        rwx[0].perms,
+                        if rwx[0].path.is_empty() { "[anon]" } else { &rwx[0].path }
+                    ))
+                    .subject(&format!("pid:{}:rwx", pid)),
+                );
             }
+        }
+        // anonymous r-x is normal for JITs and libffi trampolines; only flag in daemons
+        if !anon_rx.is_empty() && daemon && !jit {
+            flagged += 1;
+            send(
+                tx,
+                Finding::new(
+                    Severity::Warning,
+                    MODULE,
+                    "Code Injection",
+                    &format!("PID {} ({}) has {} anonymous executable region(s)", pid, name, anon_rx.len()),
+                )
+                .with_detail("Shellcode is often mapped RW, written, then mprotect'ed to RX")
+                .subject(&format!("pid:{}:anonrx", pid)),
+            );
         }
     }
-
-    // Check for statically linked JIT engines (Electron, Go, static Node)
-    // These embed V8/etc inside the binary — no .so file to find
-    if let Ok(exe_path) = fs::read_link(format!("/proc/{}/exe", pid)) {
-        // Read first 64KB of the binary and look for JIT engine symbols
-        if let Ok(data) = fs::read(&exe_path) {
-            let check_size = std::cmp::min(data.len(), 2 * 1024 * 1024); // Check first 2MB
-            let slice = &data[..check_size];
-            let jit_symbols = [
-                b"v8::Isolate" as &[u8],
-                b"V8_Fatal",
-                b"libv8",
-                b"SpiderMonkey",
-                b"JavaScriptCore",
-                b"_ZN2v8",   // V8 C++ mangled symbols
-                b"_ZN3JSC",  // JavaScriptCore mangled
-            ];
-            for sym in &jit_symbols {
-                if slice.windows(sym.len()).any(|w| w == *sym) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn rwx_anonymous_maps(tx: &Sender) {
-    progress(tx, "Scanning for RWX anonymous memory mappings (code injection)...");
-
-    let mut suspicious_pids = Vec::new();
-
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let pid_str = entry.file_name().to_string_lossy().to_string();
-            if pid_str.parse::<u32>().is_err() {
-                continue;
-            }
-
-            let maps_path = format!("/proc/{}/maps", pid_str);
-            let maps = match fs::read_to_string(&maps_path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let mut rwx_anon_count = 0;
-            let mut rwx_anon_size: u64 = 0;
-
-            for line in maps.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 5 {
-                    continue;
-                }
-
-                let perms = parts[1];
-                // rwxp = read+write+execute+private — anonymous with execute is suspicious
-                if perms == "rwxp" {
-                    let mapping_name = if parts.len() >= 6 { parts[5] } else { "" };
-                    // Anonymous = no file backing
-                    if mapping_name.is_empty() || mapping_name == "[heap]" {
-                        rwx_anon_count += 1;
-
-                        // Parse address range for size
-                        let addrs: Vec<&str> = parts[0].split('-').collect();
-                        if addrs.len() == 2 {
-                            let start = u64::from_str_radix(addrs[0], 16).unwrap_or(0);
-                            let end = u64::from_str_radix(addrs[1], 16).unwrap_or(0);
-                            rwx_anon_size += end - start;
-                        }
-                    }
-                }
-            }
-
-            if rwx_anon_count > 0 {
-                let name = fs::read_to_string(format!("/proc/{}/comm", pid_str))
-                    .unwrap_or_default().trim().to_string();
-
-                // Behavior-based JIT detection: check if process has loaded any
-                // JIT engine library — no hardcoded app names needed
-                let has_jit = process_has_jit_library(&pid_str, &maps);
-
-                if has_jit {
-                    if rwx_anon_size > 100 * 1024 * 1024 {
-                        send(tx, Finding::new(Severity::Info, MODULE, "RWX Memory",
-                            &format!("PID {} ({}) — large JIT RWX: {:.1}MB ({} regions)",
-                                pid_str, name, rwx_anon_size as f64 / 1048576.0, rwx_anon_count)));
-                    }
-                } else {
-                    suspicious_pids.push(pid_str.clone());
-                    send(tx, Finding::new(Severity::Warning, MODULE, "Code Injection",
-                        &format!("PID {} ({}) — RWX anonymous memory: {:.1}KB ({} regions)",
-                            pid_str, name, rwx_anon_size as f64 / 1024.0, rwx_anon_count))
-                        .with_detail("Process has no JIT library loaded but has executable anonymous memory"));
-                }
-            }
-        }
-    }
-
-    if suspicious_pids.is_empty() {
-        send(tx, Finding::new(Severity::Safe, MODULE, "RWX Check",
-            "No suspicious RWX anonymous mappings in non-JIT processes"));
-    }
-}
-
-fn injected_libraries(tx: &Sender) {
-    progress(tx, "Checking for injected shared libraries...");
-
-    let suspicious_lib_patterns = [
-        "/tmp/", "/dev/shm/", "/var/tmp/", "/.hidden",
-        "/root/.", "/home/.", "libcrypt_mine",
-    ];
-
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let pid_str = entry.file_name().to_string_lossy().to_string();
-            if pid_str.parse::<u32>().is_err() {
-                continue;
-            }
-
-            let maps_path = format!("/proc/{}/maps", pid_str);
-            let maps = match fs::read_to_string(&maps_path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            for line in maps.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 6 {
-                    continue;
-                }
-
-                let mapping = parts[5];
-                if !mapping.ends_with(".so") && !mapping.contains(".so.") {
-                    continue;
-                }
-
-                for pattern in &suspicious_lib_patterns {
-                    if mapping.contains(pattern) {
-                        let name = fs::read_to_string(format!("/proc/{}/comm", pid_str))
-                            .unwrap_or_default().trim().to_string();
-                        send(tx, Finding::new(Severity::Danger, MODULE, "Injected Library",
-                            &format!("PID {} ({}) loaded suspicious library: {}", pid_str, name, mapping))
-                            .with_detail("Library loaded from temp/hidden directory — likely injected"));
-                        break;
-                    }
-                }
-
-                // Check for deleted libraries still mapped
-                if mapping.contains("(deleted)") && !mapping.contains("/usr/") {
-                    let name = fs::read_to_string(format!("/proc/{}/comm", pid_str))
-                        .unwrap_or_default().trim().to_string();
-                    send(tx, Finding::new(Severity::Warning, MODULE, "Deleted Library",
-                        &format!("PID {} ({}) has deleted library mapped: {}", pid_str, name, mapping)));
-                }
-            }
-        }
-    }
-}
-
-fn devshm_analysis(tx: &Sender) {
-    progress(tx, "Analyzing /dev/shm contents...");
-
-    if let Ok(entries) = fs::read_dir("/dev/shm") {
-        let mut count = 0;
-        for entry in entries.flatten() {
-            count += 1;
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            if let Ok(meta) = path.metadata() {
-                let size = meta.len();
-
-                // Large files in /dev/shm
-                if size > 10_000_000 {
-                    send(tx, Finding::new(Severity::Info, MODULE, "/dev/shm",
-                        &format!("Large file in /dev/shm: {} ({:.1}MB)", name, size as f64 / 1048576.0)));
-                }
-
-                // Check magic bytes for executables
-                if path.is_file() {
-                    if let Ok(data) = fs::read(&path) {
-                        if data.len() >= 4 {
-                            if &data[..4] == b"\x7fELF" {
-                                send(tx, Finding::new(Severity::Danger, MODULE, "/dev/shm ELF",
-                                    &format!("ELF binary in shared memory: {}", name))
-                                    .with_detail(&format!("Size: {} bytes — likely malware staging", size)));
-                            }
-                            if data.len() >= 2 && &data[..2] == b"MZ" {
-                                send(tx, Finding::new(Severity::Danger, MODULE, "/dev/shm PE",
-                                    &format!("PE executable in shared memory: {}", name)));
-                            }
-                            // Shellcode-like patterns
-                            if data.len() > 32 {
-                                let nop_sled = data.windows(16).any(|w| w.iter().all(|&b| b == 0x90));
-                                if nop_sled {
-                                    send(tx, Finding::new(Severity::Danger, MODULE, "Shellcode",
-                                        &format!("Possible shellcode (NOP sled) in /dev/shm: {}", name)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if count == 0 {
-            send(tx, Finding::new(Severity::Safe, MODULE, "/dev/shm",
-                "/dev/shm is empty"));
-        }
+    if flagged == 0 {
+        send(tx, Finding::new(Severity::Safe, MODULE, "Memory Check", "No injected or fileless code found in process memory maps").subject("mem"));
     }
 }
 
 fn process_hollowing(tx: &Sender) {
-    progress(tx, "Checking for process hollowing indicators...");
-
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let pid_str = entry.file_name().to_string_lossy().to_string();
-            if pid_str.parse::<u32>().is_err() {
-                continue;
-            }
-
-            // Compare /proc/PID/exe target with /proc/PID/cmdline[0]
-            let exe = match fs::read_link(format!("/proc/{}/exe", pid_str)) {
-                Ok(e) => e.to_string_lossy().to_string(),
-                Err(_) => continue,
-            };
-
-            let cmdline = match fs::read_to_string(format!("/proc/{}/cmdline", pid_str)) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let cmd_first = cmdline.split('\0').next().unwrap_or("").to_string();
-
-            if exe.contains("(deleted)") {
-                continue; // Already caught by rootkit module
-            }
-
-            // If exe and cmdline[0] point to completely different binaries
-            if !cmd_first.is_empty() && !exe.is_empty() {
-                let exe_base = exe.rsplit('/').next().unwrap_or(&exe);
-                let cmd_base = cmd_first.rsplit('/').next().unwrap_or(&cmd_first);
-
-                // Some processes legitimately have different names (busybox, python scripts)
-                let legit_mismatches = ["python", "python3", "ruby", "perl", "node", "java",
-                    "bash", "sh", "zsh", "busybox", "env", "sudo", "su", "dbus"];
-
-                if exe_base != cmd_base
-                    && !legit_mismatches.iter().any(|l| exe_base.contains(l) || cmd_base.contains(l))
-                    && !cmd_first.starts_with('-') // login shells
-                {
-                    let name = fs::read_to_string(format!("/proc/{}/comm", pid_str))
-                        .unwrap_or_default().trim().to_string();
-                    send(tx, Finding::new(Severity::Info, MODULE, "Name Mismatch",
-                        &format!("PID {} — exe='{}' but cmdline='{}'", pid_str, exe_base, cmd_base))
-                        .with_detail(&format!("Process: {}\nFull exe: {}\nFull cmd: {}", name, exe, cmd_first)));
-                }
-            }
+    progress(tx, "Checking exe vs argv[0] mismatches (hollowing / masquerading)...");
+    let interpreters = ["python", "ruby", "perl", "node", "java", "bash", "sh", "zsh", "dash", "busybox", "env", "sudo", "su", "php", "lua", "electron"];
+    for pid in util::proc_pids() {
+        let (exe, deleted) = procfs::exe(pid);
+        if exe.is_empty() || deleted {
+            continue;
         }
+        let argv0 = procfs::read_cmdline_argv0(pid);
+        if argv0.is_empty() || argv0.starts_with('-') || argv0.starts_with('[') {
+            continue;
+        }
+        let exe_base = exe.rsplit('/').next().unwrap_or(&exe);
+        let cmd_base = argv0.split_whitespace().next().unwrap_or("").rsplit('/').next().unwrap_or("");
+        if cmd_base.is_empty() || exe_base == cmd_base || exe_base.starts_with(cmd_base) || cmd_base.starts_with(exe_base) {
+            continue;
+        }
+        if interpreters.iter().any(|l| exe_base.contains(l) || cmd_base.contains(l)) {
+            continue;
+        }
+        send(
+            tx,
+            Finding::new(Severity::Info, MODULE, "Name Mismatch", &format!("PID {} — exe '{}' but argv[0] '{}'", pid, exe_base, cmd_base))
+                .with_detail(&format!("Full exe: {}\nargv[0]: {}", exe, argv0))
+                .subject(&format!("pid:{}", pid)),
+        );
     }
 }
 
-pub fn scan(tx: Sender) {
+pub fn scan(_cfg: &ScanConfig, tx: Sender) {
     let start = Instant::now();
     let _ = tx.send(ScanEvent::ModuleStart(MODULE.to_string()));
-
-    rwx_anonymous_maps(&tx);
-    injected_libraries(&tx);
-    devshm_analysis(&tx);
+    injection_scan(&tx);
     process_hollowing(&tx);
-
     let _ = tx.send(ScanEvent::ModuleDone(MODULE.to_string(), start.elapsed()));
 }

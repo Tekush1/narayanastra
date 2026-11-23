@@ -1,3 +1,4 @@
+use crate::config::ScanConfig;
 use crate::report::{Finding, ScanEvent, Sender, Severity};
 use std::process::Command;
 use std::time::Instant;
@@ -12,8 +13,15 @@ fn progress(tx: &Sender, msg: &str) {
     let _ = tx.send(ScanEvent::ModuleProgress(MODULE.to_string(), msg.to_string()));
 }
 
+/// Absolute path to Windows PowerShell — never resolve "powershell" via the search path
+/// (a planted powershell.exe next to the scanner would run instead).
+fn powershell_path() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{}\System32\WindowsPowerShell\v1.0\powershell.exe", root)
+}
+
 fn run_ps(script: &str) -> Option<String> {
-    Command::new("powershell")
+    Command::new(powershell_path())
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .ok()
@@ -42,19 +50,35 @@ fn persistence_scan(tx: &Sender) {
             key
         );
         if let Some(output) = run_ps(&script) {
-            let suspicious_patterns = ["powershell", "cmd /c", "wscript", "cscript",
-                "mshta", "rundll32", "regsvr32", "%temp%", "%appdata%",
-                "\\temp\\", "\\tmp\\", "-enc", "-e ", "bypass", "hidden",
-                "downloadstring", "invoke-expression", "iex"];
+            let suspicious_patterns = [
+                "powershell",
+                "cmd /c",
+                "wscript",
+                "cscript",
+                "mshta",
+                "rundll32",
+                "regsvr32",
+                "%temp%",
+                "%appdata%",
+                "\\temp\\",
+                "\\tmp\\",
+                "-enc",
+                "-e ",
+                "bypass",
+                "hidden",
+                "downloadstring",
+                "invoke-expression",
+                "iex",
+            ];
             for line in output.lines() {
                 let trimmed = line.trim();
-                if trimmed.is_empty() { continue; }
+                if trimmed.is_empty() {
+                    continue;
+                }
                 let lower = trimmed.to_lowercase();
                 for pat in &suspicious_patterns {
                     if lower.contains(pat) {
-                        send(tx, Finding::new(Severity::Warning, MODULE, "Registry Run",
-                            &format!("Suspicious autorun in {}", key))
-                            .with_detail(trimmed));
+                        send(tx, Finding::new(Severity::Warning, MODULE, "Registry Run", &format!("Suspicious autorun in {}", key)).with_detail(trimmed));
                         break;
                     }
                 }
@@ -62,45 +86,91 @@ fn persistence_scan(tx: &Sender) {
         }
     }
 
-    // Scheduled Tasks — non-Microsoft
+    // Scheduled Tasks — the Author field is attacker-controlled ("Microsoft Corporation"),
+    // so judge every enabled task by what it actually runs.
     progress(tx, "Checking scheduled tasks...");
-    let task_script = r#"Get-ScheduledTask | Where-Object { $_.Author -notlike '*Microsoft*' -and $_.State -ne 'Disabled' } | ForEach-Object { $actions = ($_.Actions | ForEach-Object { $_.Execute + ' ' + $_.Arguments }); Write-Output "$($_.TaskName)|$($_.Author)|$actions" }"#;
+    let task_script = r#"Get-ScheduledTask | Where-Object { $_.State -ne 'Disabled' } | ForEach-Object { $actions = ($_.Actions | ForEach-Object { $_.Execute + ' ' + $_.Arguments }); Write-Output "$($_.TaskPath)$($_.TaskName)|$($_.Author)|$actions" }"#;
     if let Some(output) = run_ps(task_script) {
-        let bad_patterns = ["powershell", "cmd /c", "wscript", "mshta",
-            "\\temp\\", "\\tmp\\", "-enc", "bypass", "downloadstring"];
+        let bad_patterns = [
+            "powershell",
+            "cmd /c",
+            "cmd.exe /c",
+            "wscript",
+            "cscript",
+            "mshta",
+            "rundll32",
+            "regsvr32",
+            "\\temp\\",
+            "\\tmp\\",
+            "\\appdata\\",
+            "\\users\\public\\",
+            "-enc",
+            "bypass",
+            "downloadstring",
+            "frombase64string",
+            "iex ",
+            "iex(",
+        ];
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
-            let lower = trimmed.to_lowercase();
-            for pat in &bad_patterns {
-                if lower.contains(pat) {
-                    let parts: Vec<&str> = trimmed.splitn(3, '|').collect();
-                    let task_name = parts.first().unwrap_or(&"unknown");
-                    send(tx, Finding::new(Severity::Warning, MODULE, "Scheduled Task",
-                        &format!("Suspicious scheduled task: {}", task_name))
-                        .with_detail(trimmed));
-                    break;
-                }
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.splitn(3, '|').collect();
+            let task_name = parts.first().copied().unwrap_or("unknown");
+            let author = parts.get(1).copied().unwrap_or("").to_lowercase();
+            let action = parts.get(2).copied().unwrap_or("").to_lowercase();
+            if let Some(pat) = bad_patterns.iter().find(|p| action.contains(*p)) {
+                let sev = if author.contains("microsoft") { Severity::Danger } else { Severity::Warning };
+                send(
+                    tx,
+                    Finding::new(sev, MODULE, "Scheduled Task", &format!("Suspicious scheduled task: {} (action contains '{}')", task_name, pat))
+                        .with_detail(trimmed)
+                        .subject(task_name),
+                );
+            } else if author.contains("microsoft")
+                && !action.trim().is_empty()
+                && !action.contains("\\windows\\")
+                && !action.contains("%windir%")
+                && !action.contains("%systemroot%")
+                && !action.contains("program files")
+                && !action.contains("{")
+            {
+                send(
+                    tx,
+                    Finding::new(
+                        Severity::Warning,
+                        MODULE,
+                        "Scheduled Task",
+                        &format!("Task claims Microsoft authorship but runs outside Windows/Program Files: {}", task_name),
+                    )
+                    .with_detail(trimmed)
+                    .subject(task_name),
+                );
             }
         }
     }
 
     // Services running from unusual paths
     progress(tx, "Checking services...");
-    let svc_script = r#"Get-WmiObject Win32_Service | Where-Object { $_.PathName -ne $null } | ForEach-Object { Write-Output "$($_.Name)|$($_.PathName)|$($_.StartMode)" }"#;
+    let svc_script =
+        r#"Get-WmiObject Win32_Service | Where-Object { $_.PathName -ne $null } | ForEach-Object { Write-Output "$($_.Name)|$($_.PathName)|$($_.StartMode)" }"#;
     if let Some(output) = run_ps(svc_script) {
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let lower = trimmed.to_lowercase();
             // Services from temp/user dirs
-            if lower.contains("\\temp\\") || lower.contains("\\tmp\\")
-                || lower.contains("\\appdata\\") || lower.contains("\\downloads\\") {
+            if lower.contains("\\temp\\") || lower.contains("\\tmp\\") || lower.contains("\\appdata\\") || lower.contains("\\downloads\\") {
                 let parts: Vec<&str> = trimmed.splitn(3, '|').collect();
                 let svc_name = parts.first().unwrap_or(&"unknown");
-                send(tx, Finding::new(Severity::Warning, MODULE, "Suspicious Service",
-                    &format!("Service running from unusual path: {}", svc_name))
-                    .with_detail(trimmed));
+                send(
+                    tx,
+                    Finding::new(Severity::Warning, MODULE, "Suspicious Service", &format!("Service running from unusual path: {}", svc_name))
+                        .with_detail(trimmed),
+                );
             }
             // Unquoted service path with spaces — check the PATH portion, not the full line
             let parts: Vec<&str> = trimmed.splitn(3, '|').collect();
@@ -109,9 +179,11 @@ fn persistence_scan(tx: &Sender) {
                 let path_lower = svc_path.to_lowercase();
                 if !svc_path.starts_with('"') && path_lower.contains(' ') && path_lower.contains("\\program") {
                     let svc_name = parts.first().unwrap_or(&"unknown");
-                    send(tx, Finding::new(Severity::Warning, MODULE, "Unquoted Path",
-                        &format!("Service with unquoted path (privesc risk): {}", svc_name))
-                        .with_detail(svc_path));
+                    send(
+                        tx,
+                        Finding::new(Severity::Warning, MODULE, "Unquoted Path", &format!("Service with unquoted path (privesc risk): {}", svc_name))
+                            .with_detail(svc_path),
+                    );
                 }
             }
         }
@@ -133,9 +205,7 @@ fn dll_injection_scan(tx: &Sender) {
     if let Some(output) = run_ps(appinit_script) {
         let trimmed = output.trim();
         if !trimmed.is_empty() {
-            send(tx, Finding::new(Severity::Danger, MODULE, "DLL Injection",
-                "AppInit_DLLs is set — global DLL injection active")
-                .with_detail(trimmed));
+            send(tx, Finding::new(Severity::Danger, MODULE, "DLL Injection", "AppInit_DLLs is set — global DLL injection active").with_detail(trimmed));
         }
     }
 
@@ -147,12 +217,16 @@ fn dll_injection_scan(tx: &Sender) {
     if let Some(output) = run_ps(ifeo_script) {
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let parts: Vec<&str> = trimmed.splitn(2, '|').collect();
             let target = parts.first().unwrap_or(&"unknown");
-            send(tx, Finding::new(Severity::Danger, MODULE, "IFEO Hijack",
-                &format!("Image File Execution Options debugger set for: {}", target))
-                .with_detail(trimmed));
+            send(
+                tx,
+                Finding::new(Severity::Danger, MODULE, "IFEO Hijack", &format!("Image File Execution Options debugger set for: {}", target))
+                    .with_detail(trimmed),
+            );
         }
     }
 
@@ -162,19 +236,19 @@ fn dll_injection_scan(tx: &Sender) {
         if ($known) { $known.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' } | ForEach-Object { Write-Output "$($_.Name)=$($_.Value)" } }
     "#;
     if let Some(output) = run_ps(knowndlls_script) {
-        let standard_dlls = ["kernel32", "ntdll", "user32", "gdi32", "advapi32",
-            "shell32", "ole32", "oleaut32", "msvcrt", "comdlg32", "comctl32",
-            "shlwapi", "rpcrt4", "secur32", "ws2_32", "crypt32", "imm32",
-            "setupapi", "cfgmgr32", "clbcatq", "difxapi", "iertutil",
-            "imagehlp", "msctf", "normaliz", "nsi", "psapi", "shcore",
-            "wldap32", "wow64", "wow64cpu", "wow64win"];
+        let standard_dlls = [
+            "kernel32", "ntdll", "user32", "gdi32", "advapi32", "shell32", "ole32", "oleaut32", "msvcrt", "comdlg32", "comctl32", "shlwapi", "rpcrt4",
+            "secur32", "ws2_32", "crypt32", "imm32", "setupapi", "cfgmgr32", "clbcatq", "difxapi", "iertutil", "imagehlp", "msctf", "normaliz", "nsi", "psapi",
+            "shcore", "wldap32", "wow64", "wow64cpu", "wow64win",
+        ];
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let lower = trimmed.to_lowercase();
             if !standard_dlls.iter().any(|d| lower.contains(d)) {
-                send(tx, Finding::new(Severity::Info, MODULE, "KnownDLLs",
-                    &format!("Non-standard KnownDLLs entry: {}", trimmed)));
+                send(tx, Finding::new(Severity::Info, MODULE, "KnownDLLs", &format!("Non-standard KnownDLLs entry: {}", trimmed)));
             }
         }
     }
@@ -191,17 +265,20 @@ fn process_scan(tx: &Sender) {
     if let Some(output) = run_ps(proc_script) {
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let lower = trimmed.to_lowercase();
 
-            if lower.contains("\\temp\\") || lower.contains("\\tmp\\")
-                || lower.contains("\\downloads\\") || lower.contains("\\appdata\\local\\temp") {
+            if lower.contains("\\temp\\") || lower.contains("\\tmp\\") || lower.contains("\\downloads\\") || lower.contains("\\appdata\\local\\temp") {
                 let parts: Vec<&str> = trimmed.splitn(3, '|').collect();
                 let pid = parts.first().unwrap_or(&"?");
                 let name = parts.get(1).unwrap_or(&"?");
-                send(tx, Finding::new(Severity::Warning, MODULE, "Temp Process",
-                    &format!("PID {} ({}) running from temp directory", pid, name))
-                    .with_detail(parts.get(2).unwrap_or(&"")));
+                send(
+                    tx,
+                    Finding::new(Severity::Warning, MODULE, "Temp Process", &format!("PID {} ({}) running from temp directory", pid, name))
+                        .with_detail(parts.get(2).unwrap_or(&"")),
+                );
             }
         }
     }
@@ -209,20 +286,35 @@ fn process_scan(tx: &Sender) {
     // PowerShell with suspicious arguments
     let ps_script = r#"Get-WmiObject Win32_Process | Where-Object { $_.Name -like '*powershell*' -or $_.Name -like '*pwsh*' } | ForEach-Object { Write-Output "$($_.ProcessId)|$($_.CommandLine)" }"#;
     if let Some(output) = run_ps(ps_script) {
-        let bad = ["-enc", "-encodedcommand", "bypass", "hidden", "-w hidden",
-            "downloadstring", "invoke-expression", "iex(", "iex (", "net.webclient",
-            "invoke-webrequest", "start-bitstransfer"];
+        let bad = [
+            "-enc",
+            "-encodedcommand",
+            "bypass",
+            "hidden",
+            "-w hidden",
+            "downloadstring",
+            "invoke-expression",
+            "iex(",
+            "iex (",
+            "net.webclient",
+            "invoke-webrequest",
+            "start-bitstransfer",
+        ];
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let lower = trimmed.to_lowercase();
             for pat in &bad {
                 if lower.contains(pat) {
                     let parts: Vec<&str> = trimmed.splitn(2, '|').collect();
                     let pid = parts.first().unwrap_or(&"?");
-                    send(tx, Finding::new(Severity::Danger, MODULE, "Suspicious PS",
-                        &format!("PowerShell PID {} with suspicious args", pid))
-                        .with_detail(parts.get(1).unwrap_or(&"")));
+                    send(
+                        tx,
+                        Finding::new(Severity::Danger, MODULE, "Suspicious PS", &format!("PowerShell PID {} with suspicious args", pid))
+                            .with_detail(parts.get(1).unwrap_or(&"")),
+                    );
                     break;
                 }
             }
@@ -242,9 +334,13 @@ fn network_scan(tx: &Sender) {
 
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let parts: Vec<&str> = trimmed.split('|').collect();
-            if parts.len() < 6 { continue; }
+            if parts.len() < 6 {
+                continue;
+            }
 
             let state = parts[0];
             let local_port: u16 = parts[1].parse().unwrap_or(0);
@@ -254,14 +350,20 @@ fn network_scan(tx: &Sender) {
 
             // Suspicious listening ports
             if state == "Listen" && suspicious_ports.contains(&local_port) {
-                send(tx, Finding::new(Severity::Warning, MODULE, "Suspicious Port",
-                    &format!("Listening on suspicious port {} ({})", local_port, proc_name)));
+                send(tx, Finding::new(Severity::Warning, MODULE, "Suspicious Port", &format!("Listening on suspicious port {} ({})", local_port, proc_name)));
             }
 
             // Outbound to suspicious ports
             if state == "Established" && suspicious_ports.contains(&remote_port) {
-                send(tx, Finding::new(Severity::Danger, MODULE, "C2 Connection",
-                    &format!("Outbound to {}:{} by {} — possible C2", remote_addr, remote_port, proc_name)));
+                send(
+                    tx,
+                    Finding::new(
+                        Severity::Danger,
+                        MODULE,
+                        "C2 Connection",
+                        &format!("Outbound to {}:{} by {} — possible C2", remote_addr, remote_port, proc_name),
+                    ),
+                );
             }
         }
     }
@@ -272,8 +374,7 @@ fn network_scan(tx: &Sender) {
         for line in output.lines() {
             let parts: Vec<&str> = line.trim().split('|').collect();
             if parts.len() >= 2 && parts[1].trim().to_lowercase() == "false" {
-                send(tx, Finding::new(Severity::Warning, MODULE, "Firewall",
-                    &format!("Windows Firewall '{}' profile is DISABLED", parts[0])));
+                send(tx, Finding::new(Severity::Warning, MODULE, "Firewall", &format!("Windows Firewall '{}' profile is DISABLED", parts[0])));
             }
         }
     }
@@ -286,7 +387,8 @@ fn credential_scan(tx: &Sender) {
     progress(tx, "Checking user accounts and credentials...");
 
     // Hidden/new admin accounts
-    let admin_script = r#"Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | ForEach-Object { Write-Output "$($_.Name)|$($_.ObjectClass)" }"#;
+    let admin_script =
+        r#"Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | ForEach-Object { Write-Output "$($_.Name)|$($_.ObjectClass)" }"#;
     if let Some(output) = run_ps(admin_script) {
         let mut admins = Vec::new();
         for line in output.lines() {
@@ -295,19 +397,20 @@ fn credential_scan(tx: &Sender) {
                 admins.push(trimmed.to_string());
             }
         }
-        send(tx, Finding::new(Severity::Info, MODULE, "Admin Accounts",
-            &format!("{} administrator account(s) found", admins.len()))
-            .with_detail(&admins.join("\n")));
+        send(
+            tx,
+            Finding::new(Severity::Info, MODULE, "Admin Accounts", &format!("{} administrator account(s) found", admins.len())).with_detail(&admins.join("\n")),
+        );
     }
 
     // Accounts with blank passwords
-    let blank_pw_script = r#"Get-LocalUser | Where-Object { $_.PasswordRequired -eq $false -and $_.Enabled -eq $true } | ForEach-Object { Write-Output $_.Name }"#;
+    let blank_pw_script =
+        r#"Get-LocalUser | Where-Object { $_.PasswordRequired -eq $false -and $_.Enabled -eq $true } | ForEach-Object { Write-Output $_.Name }"#;
     if let Some(output) = run_ps(blank_pw_script) {
         for line in output.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                send(tx, Finding::new(Severity::Danger, MODULE, "Blank Password",
-                    &format!("Enabled account with no password required: {}", trimmed)));
+                send(tx, Finding::new(Severity::Danger, MODULE, "Blank Password", &format!("Enabled account with no password required: {}", trimmed)));
             }
         }
     }
@@ -316,8 +419,7 @@ fn credential_scan(tx: &Sender) {
     let rdp_script = r#"(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue).fDenyTSConnections"#;
     if let Some(output) = run_ps(rdp_script) {
         if output.trim() == "0" {
-            send(tx, Finding::new(Severity::Info, MODULE, "RDP",
-                "Remote Desktop is ENABLED"));
+            send(tx, Finding::new(Severity::Info, MODULE, "RDP", "Remote Desktop is ENABLED"));
         }
     }
 
@@ -325,8 +427,7 @@ fn credential_scan(tx: &Sender) {
     let winrm_script = r#"(Get-Service WinRM -ErrorAction SilentlyContinue).Status"#;
     if let Some(output) = run_ps(winrm_script) {
         if output.trim().to_lowercase() == "running" {
-            send(tx, Finding::new(Severity::Info, MODULE, "WinRM",
-                "WinRM service is running — remote management enabled"));
+            send(tx, Finding::new(Severity::Info, MODULE, "WinRM", "WinRM service is running — remote management enabled"));
         }
     }
 }
@@ -342,32 +443,50 @@ fn driver_scan(tx: &Sender) {
     if let Some(output) = run_ps(drv_script) {
         for line in output.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let lower = trimmed.to_lowercase();
-            if lower.contains("\\temp\\") || lower.contains("\\tmp\\")
-                || lower.contains("\\downloads\\") || lower.contains("\\appdata\\") {
+            if lower.contains("\\temp\\") || lower.contains("\\tmp\\") || lower.contains("\\downloads\\") || lower.contains("\\appdata\\") {
                 let parts: Vec<&str> = trimmed.splitn(3, '|').collect();
                 let name = parts.first().unwrap_or(&"?");
-                send(tx, Finding::new(Severity::Danger, MODULE, "Suspicious Driver",
-                    &format!("Driver loaded from unusual path: {}", name))
-                    .with_detail(trimmed));
+                send(
+                    tx,
+                    Finding::new(Severity::Danger, MODULE, "Suspicious Driver", &format!("Driver loaded from unusual path: {}", name)).with_detail(trimmed),
+                );
             }
         }
     }
 
+    // Unsigned / badly signed running drivers
+    let sig_script = r#"Get-WmiObject Win32_SystemDriver | Where-Object { $_.Started -eq $true -and $_.PathName } | ForEach-Object { $p = $_.PathName -replace '^\\\?\?\\','' -replace '^\\SystemRoot', $env:SystemRoot -replace '^System32', ($env:SystemRoot + '\System32'); if (Test-Path $p) { $s = Get-AuthenticodeSignature -FilePath $p; if ($s.Status -ne 'Valid') { Write-Output "$($_.Name)|$p|$($s.Status)" } } }"#;
+    if let Some(output) = run_ps(sig_script) {
+        for line in output.lines().filter(|l| !l.trim().is_empty()) {
+            let parts: Vec<&str> = line.trim().splitn(3, '|').collect();
+            send(
+                tx,
+                Finding::new(
+                    Severity::Warning,
+                    MODULE,
+                    "Suspicious Driver",
+                    &format!("Running driver without a valid signature: {}", parts.first().unwrap_or(&"?")),
+                )
+                .with_detail(line.trim())
+                .subject(parts.first().unwrap_or(&"?")),
+            );
+        }
+    }
+
     // Check for known rootkit driver names
-    let rootkit_drivers = ["fgexec", "beep", "null", "tdl", "max++", "rustock",
-        "necurs", "zeroaccess", "alureon", "pihar", "sirefef"];
-    let check_script = format!(
-        "Get-WmiObject Win32_SystemDriver | Where-Object {{ $_.Started -eq $true }} | ForEach-Object {{ Write-Output $_.Name }}"
-    );
+    // exact names only — "beep" and "null" are real Windows drivers present on every system
+    let rootkit_drivers = ["tdl", "tdl4", "max++", "rustock", "necurs", "zeroaccess", "alureon", "pihar", "sirefef", "fgexec", "rkhide"];
+    let check_script = format!("Get-WmiObject Win32_SystemDriver | Where-Object {{ $_.Started -eq $true }} | ForEach-Object {{ Write-Output $_.Name }}");
     if let Some(output) = run_ps(&check_script) {
         for line in output.lines() {
             let name = line.trim().to_lowercase();
             for rk in &rootkit_drivers {
-                if name.contains(rk) {
-                    send(tx, Finding::new(Severity::Danger, MODULE, "Rootkit Driver",
-                        &format!("Known rootkit driver name detected: {}", line.trim())));
+                if name == *rk {
+                    send(tx, Finding::new(Severity::Danger, MODULE, "Rootkit Driver", &format!("Known rootkit driver name detected: {}", line.trim())));
                 }
             }
         }
@@ -386,9 +505,7 @@ fn eventlog_scan(tx: &Sender) {
         for line in output.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                send(tx, Finding::new(Severity::Danger, MODULE, "Log Cleared",
-                    "Security Event Log was cleared")
-                    .with_detail(trimmed));
+                send(tx, Finding::new(Severity::Danger, MODULE, "Log Cleared", "Security Event Log was cleared").with_detail(trimmed));
             }
         }
     }
@@ -399,8 +516,7 @@ fn eventlog_scan(tx: &Sender) {
         for line in output.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                send(tx, Finding::new(Severity::Danger, MODULE, "Log Disabled",
-                    &format!("Critical event log is DISABLED: {}", trimmed)));
+                send(tx, Finding::new(Severity::Danger, MODULE, "Log Disabled", &format!("Critical event log is DISABLED: {}", trimmed)));
             }
         }
     }
@@ -410,11 +526,9 @@ fn eventlog_scan(tx: &Sender) {
     if let Some(output) = run_ps(brute_script) {
         if let Ok(count) = output.trim().parse::<u32>() {
             if count > 100 {
-                send(tx, Finding::new(Severity::Warning, MODULE, "Brute Force",
-                    &format!("{} failed login attempts detected", count)));
+                send(tx, Finding::new(Severity::Warning, MODULE, "Brute Force", &format!("{} failed login attempts detected", count)));
             } else if count > 0 {
-                send(tx, Finding::new(Severity::Info, MODULE, "Failed Logins",
-                    &format!("{} failed login attempt(s) in security log", count)));
+                send(tx, Finding::new(Severity::Info, MODULE, "Failed Logins", &format!("{} failed login attempt(s) in security log", count)));
             }
         }
     }
@@ -423,8 +537,7 @@ fn eventlog_scan(tx: &Sender) {
     let defender_script = r#"(Get-MpPreference -ErrorAction SilentlyContinue).DisableRealtimeMonitoring"#;
     if let Some(output) = run_ps(defender_script) {
         if output.trim().to_lowercase() == "true" {
-            send(tx, Finding::new(Severity::Danger, MODULE, "Defender Off",
-                "Windows Defender real-time monitoring is DISABLED"));
+            send(tx, Finding::new(Severity::Danger, MODULE, "Defender Off", "Windows Defender real-time monitoring is DISABLED"));
         }
     }
 }
@@ -432,7 +545,7 @@ fn eventlog_scan(tx: &Sender) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  PUBLIC ENTRY POINT
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-pub fn scan(tx: Sender) {
+pub fn scan(_cfg: &ScanConfig, tx: Sender) {
     let start = Instant::now();
     let _ = tx.send(ScanEvent::ModuleStart(MODULE.to_string()));
 

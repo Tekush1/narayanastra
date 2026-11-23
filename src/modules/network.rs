@@ -1,426 +1,358 @@
-use crate::report::{Finding, ScanEvent, Sender, Severity};
-use std::fs;
-use std::process::Command;
-use std::time::Instant;
-use std::collections::HashMap;
+use crate::config::ScanConfig;
+use crate::netdiag::{self, Conn, Proto};
+use crate::procfs;
+use crate::report::{progress as prog, send, Finding, ScanEvent, Sender, Severity};
+use crate::util;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 const MODULE: &str = "NETWORK";
 
-fn send(tx: &Sender, finding: Finding) {
-    let _ = tx.send(ScanEvent::Finding(finding));
-}
-
 fn progress(tx: &Sender, msg: &str) {
-    let _ = tx.send(ScanEvent::ModuleProgress(MODULE.to_string(), msg.to_string()));
+    prog(tx, MODULE, msg)
 }
 
-fn hex_to_ip(hex: &str) -> Option<String> {
-    if hex.len() == 8 {
-        // IPv4
-        let bytes: Vec<u8> = (0..4)
-            .map(|i| u8::from_str_radix(&hex[i*2..i*2+2], 16).unwrap_or(0))
-            .collect();
-        Some(format!("{}.{}.{}.{}", bytes[3], bytes[2], bytes[1], bytes[0]))
+fn owner_str(map: &HashMap<u64, (u32, String)>, inode: u64) -> String {
+    map.get(&inode).map(|(pid, n)| format!("{} (PID {})", n, pid)).unwrap_or_else(|| "unknown".into())
+}
+
+/// /proc/net (seq_file) vs netlink sock_diag, in BOTH directions, TCP and UDP, v4 and v6.
+/// Rootkits that hook tcp4_seq_show hide from /proc/net/tcp while netlink still sees the
+/// socket — the old code only checked the opposite direction, so it missed exactly that.
+fn cross_view(tx: &Sender, proc_view: &[Conn], nl_view: Option<&Vec<Conn>>, owners: &HashMap<u64, (u32, String)>) {
+    progress(tx, "Cross-checking sockets: netlink sock_diag vs /proc/net/{tcp,udp}{,6}...");
+    let nl = match nl_view {
+        Some(v) => v,
+        None => {
+            send(tx, Finding::new(Severity::Info, MODULE, "Port Integrity", "netlink sock_diag unavailable — cross-view skipped").subject("xview"));
+            return;
+        }
+    };
+    let key = |c: &Conn| (c.proto, c.v6, c.lport, c.inode);
+    let proc_set: HashSet<_> = proc_view.iter().filter(|c| c.is_listener() || c.state == netdiag::TCP_ESTABLISHED).map(key).collect();
+    let nl_set: HashSet<_> = nl.iter().filter(|c| c.is_listener() || c.state == netdiag::TCP_ESTABLISHED).map(key).collect();
+
+    // give racing sockets a moment, then re-read both views before reporting
+    let only_nl: Vec<_> = nl_set.difference(&proc_set).copied().collect();
+    let only_proc: Vec<_> = proc_set.difference(&nl_set).copied().collect();
+    let (only_nl, only_proc) = if only_nl.is_empty() && only_proc.is_empty() {
+        (only_nl, only_proc)
     } else {
-        None
+        std::thread::sleep(Duration::from_millis(150));
+        let p2: HashSet<_> = netdiag::proc_net_all().iter().map(key).collect();
+        let n2: HashSet<_> = netdiag::netlink_all().unwrap_or_default().iter().map(key).collect();
+        (
+            only_nl.into_iter().filter(|k| n2.contains(k) && !p2.contains(k)).collect::<Vec<_>>(),
+            only_proc.into_iter().filter(|k| p2.contains(k) && !n2.contains(k)).collect::<Vec<_>>(),
+        )
+    };
+
+    for (proto, v6, port, inode) in &only_nl {
+        send(
+            tx,
+            Finding::new(
+                Severity::Danger,
+                MODULE,
+                "Hidden Ports",
+                &format!("{}{} port {} is visible to netlink but hidden from /proc/net — seq_show hook", proto, if *v6 { "6" } else { "" }, port),
+            )
+            .with_detail(&format!("Owner: {}", owner_str(owners, *inode)))
+            .subject(&format!("{}:{}:{}", proto, v6, port)),
+        );
+    }
+    for (proto, v6, port, inode) in &only_proc {
+        send(
+            tx,
+            Finding::new(
+                Severity::Warning,
+                MODULE,
+                "Hidden Ports",
+                &format!("{}{} port {} is in /proc/net but missing from netlink", proto, if *v6 { "6" } else { "" }, port),
+            )
+            .with_detail(&format!("Owner: {}", owner_str(owners, *inode)))
+            .subject(&format!("{}:{}:{}", proto, v6, port)),
+        );
+    }
+    if only_nl.is_empty() && only_proc.is_empty() {
+        send(
+            tx,
+            Finding::new(
+                Severity::Safe,
+                MODULE,
+                "Port Integrity",
+                &format!("netlink and /proc/net agree ({} listeners)", nl.iter().filter(|c| c.is_listener()).count()),
+            )
+            .subject("xview"),
+        );
     }
 }
 
-fn hex_to_port(hex: &str) -> u16 {
-    u16::from_str_radix(hex, 16).unwrap_or(0)
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-struct RawConnection {
-    local_ip: String,
-    local_port: u16,
-    remote_ip: String,
-    remote_port: u16,
-    state: u8,
-    inode: u64,
-}
-
-fn parse_proc_net_tcp() -> Vec<RawConnection> {
-    let mut conns = Vec::new();
-
-    for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
-        if let Ok(content) = fs::read_to_string(path) {
-            for line in content.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 10 {
+/// Ask the kernel directly: bind() every port. EADDRINUSE on a port that no view lists
+/// means a listener hidden from both /proc and netlink.
+fn bind_probe(cfg: &ScanConfig, tx: &Sender, all: &[Conn]) {
+    progress(tx, "Bind-probing every TCP/UDP port for listeners hidden from all views...");
+    let known: HashSet<(Proto, u16)> = all.iter().map(|c| c.key()).collect();
+    let first = if cfg.is_root { 1u16 } else { 1025 };
+    let mut hidden = Vec::new();
+    for proto in [Proto::Tcp, Proto::Udp] {
+        for v6 in [false, true] {
+            for port in first..=65535u16 {
+                if known.contains(&(proto, port)) {
                     continue;
                 }
-
-                let local_parts: Vec<&str> = parts[1].split(':').collect();
-                let remote_parts: Vec<&str> = parts[2].split(':').collect();
-
-                if local_parts.len() != 2 || remote_parts.len() != 2 {
-                    continue;
-                }
-
-                let local_ip = hex_to_ip(local_parts[0]).unwrap_or_else(|| local_parts[0].to_string());
-                let local_port = hex_to_port(local_parts[1]);
-                let remote_ip = hex_to_ip(remote_parts[0]).unwrap_or_else(|| remote_parts[0].to_string());
-                let remote_port = hex_to_port(remote_parts[1]);
-                let state = u8::from_str_radix(parts[3], 16).unwrap_or(0);
-                let inode = parts[9].parse().unwrap_or(0);
-
-                conns.push(RawConnection {
-                    local_ip, local_port, remote_ip, remote_port, state, inode,
-                });
-            }
-        }
-    }
-
-    conns
-}
-
-fn ss_vs_proc_compare(tx: &Sender) {
-    progress(tx, "Comparing ss output vs /proc/net/tcp (hidden port detection)...");
-
-    let proc_conns = parse_proc_net_tcp();
-    let proc_listening: Vec<u16> = proc_conns.iter()
-        .filter(|c| c.state == 10) // LISTEN state
-        .map(|c| c.local_port)
-        .collect();
-
-    // Get ss listening ports
-    let mut ss_listening = Vec::new();
-    if let Ok(output) = Command::new("ss").args(["-tlnH"]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let addr = parts[3];
-                if let Some(colon) = addr.rfind(':') {
-                    if let Ok(port) = addr[colon+1..].parse::<u16>() {
-                        ss_listening.push(port);
-                    }
+                if netdiag::port_in_use(proto, v6, port) {
+                    hidden.push((proto, v6, port));
                 }
             }
         }
     }
-
-    // Ports in /proc but NOT in ss = potentially hidden by rootkit
-    let hidden: Vec<u16> = proc_listening.iter()
-        .filter(|p| !ss_listening.contains(p) && **p > 0)
-        .copied()
-        .collect();
-
+    // re-verify against fresh views (ephemeral ports come and go)
     if !hidden.is_empty() {
-        send(tx, Finding::new(Severity::Danger, MODULE, "Hidden Ports",
-            &format!("{} port(s) in /proc/net/tcp but hidden from ss — rootkit may be hiding connections", hidden.len()))
-            .with_detail(&format!("Hidden ports: {:?}", hidden)));
-    } else {
-        send(tx, Finding::new(Severity::Safe, MODULE, "Port Integrity",
-            &format!("ss vs /proc/net/tcp consistent — no hidden ports ({} listening)", proc_listening.len())));
+        std::thread::sleep(Duration::from_millis(200));
+        let mut fresh: Vec<Conn> = netdiag::proc_net_all();
+        fresh.extend(netdiag::netlink_all().unwrap_or_default());
+        let known2: HashSet<(Proto, u16)> = fresh.iter().map(|c| c.key()).collect();
+        hidden.retain(|(p, v6, port)| !known2.contains(&(*p, *port)) && netdiag::port_in_use(*p, *v6, *port));
+    }
+    for (proto, v6, port) in &hidden {
+        send(
+            tx,
+            Finding::new(
+                Severity::Danger,
+                MODULE,
+                "Hidden Listener",
+                &format!("{}{} port {} is bound (bind() → EADDRINUSE) but appears in no socket view", proto, if *v6 { "6" } else { "" }, port),
+            )
+            .with_detail("A kernel rootkit is hiding this socket from both /proc/net and netlink")
+            .subject(&format!("bind:{}:{}:{}", proto, v6, port)),
+        );
+    }
+    if hidden.is_empty() {
+        send(tx, Finding::new(Severity::Safe, MODULE, "Bind Probe", &format!("No hidden listeners (ports {}-65535, tcp/udp, v4/v6)", first)).subject("bind"));
     }
 }
 
-fn deep_listening_scan(tx: &Sender) {
-    progress(tx, "Deep scanning listening ports...");
-
-    let suspicious_ports = [4444, 5555, 6666, 7777, 8888, 9999, 1337, 31337, 12345,
-        4443, 3389, 5900, 5901, 6667, 6697, 1234, 4321, 2222, 3333, 9001, 9050, 9150];
-
-    if let Ok(output) = Command::new("ss").args(["-tlnpH"]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut listen_count = 0;
-
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 4 {
-                continue;
-            }
-            listen_count += 1;
-
-            let addr = parts[3];
-            if let Some(colon) = addr.rfind(':') {
-                if let Ok(port) = addr[colon+1..].parse::<u16>() {
-                    let proc_info = if parts.len() >= 6 { parts[5..].join(" ") } else { "unknown".to_string() };
-
-                    if suspicious_ports.contains(&port) {
-                        send(tx, Finding::new(Severity::Warning, MODULE, "Suspicious Port",
-                            &format!("Listening on suspicious port: {}", port))
-                            .with_detail(&format!("Address: {}\nProcess: {}", addr, proc_info)));
-                    }
-                }
+fn listening_analysis(tx: &Sender, all: &[Conn], owners: &HashMap<u64, (u32, String)>) {
+    progress(tx, "Analyzing listening sockets...");
+    let suspicious_ports: HashSet<u16> =
+        [4444, 5555, 6666, 7777, 1337, 31337, 12345, 4443, 6667, 6697, 1234, 4321, 9001, 9050, 9150, 2323, 65535].into_iter().collect();
+    let mut seen = HashSet::new();
+    let mut count = 0;
+    for c in all.iter().filter(|c| c.is_listener()) {
+        if !seen.insert((c.proto, c.lport)) {
+            continue;
+        }
+        count += 1;
+        let owner = owners.get(&c.inode);
+        if suspicious_ports.contains(&c.lport) {
+            send(
+                tx,
+                Finding::new(Severity::Warning, MODULE, "Suspicious Port", &format!("Listening on {} port {}", c.proto, c.lport))
+                    .with_detail(&format!("Address: {}\nProcess: {}", c.local, owner_str(owners, c.inode)))
+                    .subject(&format!("{}:{}", c.proto, c.lport)),
+            );
+        }
+        // a listener owned by a binary in a temp dir or a deleted binary
+        if let Some((pid, name)) = owner {
+            let (exe, deleted) = procfs::exe(*pid);
+            if util::is_temp_path(&exe) || deleted || exe.starts_with("/memfd:") {
+                send(
+                    tx,
+                    Finding::new(
+                        Severity::Danger,
+                        MODULE,
+                        "Suspicious Port",
+                        &format!("{} port {} owned by {} running from {}{}", c.proto, c.lport, name, exe, if deleted { " (deleted)" } else { "" }),
+                    )
+                    .subject(&format!("{}:{}:exe", c.proto, c.lport))
+                    .artifact(&format!("/proc/{}/exe", pid)),
+                );
             }
         }
-
-        send(tx, Finding::new(Severity::Info, MODULE, "Listening",
-            &format!("{} listening ports found", listen_count)));
     }
+    send(tx, Finding::new(Severity::Info, MODULE, "Listening", &format!("{} listening sockets", count)).subject("listening"));
 }
 
-fn outbound_analysis(tx: &Sender) {
+fn outbound_analysis(tx: &Sender, all: &[Conn], owners: &HashMap<u64, (u32, String)>) {
     progress(tx, "Analyzing outbound connections...");
-
-    let conns = parse_proc_net_tcp();
-    let established: Vec<&RawConnection> = conns.iter()
-        .filter(|c| c.state == 1 && c.remote_ip != "127.0.0.1" && c.remote_ip != "0.0.0.0")
-        .collect();
-
-    // Build inode-to-process map
-    let mut inode_map: HashMap<u64, (u32, String)> = HashMap::new();
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let pid_str = entry.file_name().to_string_lossy().to_string();
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                let fd_dir = format!("/proc/{}/fd", pid);
-                if let Ok(fds) = fs::read_dir(&fd_dir) {
-                    for fd in fds.flatten() {
-                        if let Ok(link) = fs::read_link(fd.path()) {
-                            let link_str = link.to_string_lossy().to_string();
-                            if link_str.starts_with("socket:[") {
-                                if let Some(inode_str) = link_str.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) {
-                                    if let Ok(inode) = inode_str.parse::<u64>() {
-                                        let name = fs::read_to_string(format!("/proc/{}/comm", pid))
-                                            .unwrap_or_default().trim().to_string();
-                                        inode_map.insert(inode, (pid, name));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    let c2_ports: HashSet<u16> = [4444, 5555, 6666, 7777, 1337, 31337, 12345, 6667, 6697, 9001].into_iter().collect();
+    let established: Vec<&Conn> =
+        all.iter().filter(|c| c.proto == Proto::Tcp && c.state == netdiag::TCP_ESTABLISHED && !netdiag::is_loopback_or_unspec(&c.remote)).collect();
+    let mut seen = HashSet::new();
+    for c in &established {
+        if !seen.insert((c.remote, c.rport, c.lport)) {
+            continue;
+        }
+        if c2_ports.contains(&c.rport) {
+            send(
+                tx,
+                Finding::new(Severity::Warning, MODULE, "Suspicious Outbound", &format!("Connection to {}:{} (common C2 port)", c.remote, c.rport))
+                    .with_detail(&format!("Process: {}", owner_str(owners, c.inode)))
+                    .subject(&format!("out:{}:{}", c.remote, c.rport)),
+            );
         }
     }
-
-    let non_standard = [4444, 5555, 6666, 7777, 1337, 31337, 12345, 6667, 6697, 9001];
-
-    for conn in &established {
-        let proc_info = inode_map.get(&conn.inode)
-            .map(|(pid, name)| format!("{} (PID {})", name, pid))
-            .unwrap_or_else(|| "unknown".to_string());
-
-        if non_standard.contains(&conn.remote_port) {
-            send(tx, Finding::new(Severity::Warning, MODULE, "Suspicious Outbound",
-                &format!("Connection to {}:{} (suspicious port)", conn.remote_ip, conn.remote_port))
-                .with_detail(&format!("Process: {}", proc_info)));
-        }
-    }
-
-    send(tx, Finding::new(Severity::Info, MODULE, "Outbound",
-        &format!("{} established outbound connections", established.len())));
+    send(tx, Finding::new(Severity::Info, MODULE, "Outbound", &format!("{} established remote TCP connections", seen.len())).subject("outbound"));
 }
 
-fn is_virtual_bridge_member(iface: &str) -> bool {
-    // Behavior-based: check if interface is a bridge member or virtual device
-    // No name whitelisting — works for any container runtime, VM, or overlay
-
-    // 1. Has a bridge master? → it's a bridge port (Docker, podman, LXC, etc.)
-    let master_path = format!("/sys/class/net/{}/master", iface);
-    if std::path::Path::new(&master_path).exists() {
+fn is_virtual_iface(iface: &str) -> bool {
+    let base = format!("/sys/class/net/{}", iface);
+    let p = |x: &str| std::path::Path::new(&format!("{}/{}", base, x)).exists();
+    if p("master") || p("bridge") || p("tun_flags") || !p("device") {
+        return true; // bridge port, bridge, tun/tap, or no physical device behind it
+    }
+    let rd = |x: &str| util::read_proc(format!("{}/{}", base, x)).map(|s| s.trim().to_string());
+    if rd("type").as_deref() == Some("65534") {
         return true;
     }
-
-    // 2. Is itself a bridge? (brctl, docker network)
-    let bridge_path = format!("/sys/class/net/{}/bridge", iface);
-    if std::path::Path::new(&bridge_path).exists() {
-        return true;
-    }
-
-    // 3. Is a virtual device? (tun/tap/veth — type tells us)
-    let type_path = format!("/sys/class/net/{}/type", iface);
-    if let Ok(type_str) = fs::read_to_string(&type_path) {
-        let net_type = type_str.trim().parse::<u32>().unwrap_or(0);
-        // Type 65534 = "none" (tun/veth in a netns)
-        if net_type == 65534 {
-            return true;
-        }
-    }
-
-    // 4. No carrier and in a network namespace (loopback-like virtual)
-    let operstate = format!("/sys/class/net/{}/operstate", iface);
-    let iflink = format!("/sys/class/net/{}/iflink", iface);
-    let ifindex = format!("/sys/class/net/{}/ifindex", iface);
-    if let (Ok(link), Ok(index)) = (fs::read_to_string(&iflink), fs::read_to_string(&ifindex)) {
-        // veth pairs: iflink != ifindex (peer is in another namespace)
-        if link.trim() != index.trim() {
-            return true;
-        }
-    }
-    let _ = operstate; // suppress warning
-
-    false
+    matches!((rd("iflink"), rd("ifindex")), (Some(a), Some(b)) if a != b)
 }
 
 fn promiscuous_check(tx: &Sender) {
-    progress(tx, "Checking for promiscuous network interfaces...");
-
-    if let Ok(content) = fs::read_to_string("/proc/net/dev") {
-        for line in content.lines().skip(2) {
-            if let Some(iface) = line.split(':').next() {
-                let iface = iface.trim();
-
-                // Skip loopback
-                if iface == "lo" {
-                    continue;
-                }
-
-                let flags_path = format!("/sys/class/net/{}/flags", iface);
-                if let Ok(flags_str) = fs::read_to_string(&flags_path) {
-                    if let Ok(flags) = u32::from_str_radix(flags_str.trim().trim_start_matches("0x"), 16) {
-                        // IFF_PROMISC = 0x100
-                        if flags & 0x100 != 0 {
-                            // Behavior check: is this a virtual/bridge interface?
-                            if is_virtual_bridge_member(iface) {
-                                // Virtual interfaces in promisc = normal, skip
-                                continue;
-                            }
-                            send(tx, Finding::new(Severity::Warning, MODULE, "Promiscuous",
-                                &format!("Physical interface '{}' is in promiscuous mode — possible sniffer", iface)));
-                        }
-                    }
-                }
-            }
+    progress(tx, "Checking for promiscuous physical interfaces...");
+    for iface in util::list_dir_raw("/sys/class/net").unwrap_or_default() {
+        if iface == "lo" {
+            continue;
+        }
+        let flags = util::read_proc(format!("/sys/class/net/{}/flags", iface))
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        if flags & 0x100 != 0 && !is_virtual_iface(&iface) {
+            send(
+                tx,
+                Finding::new(Severity::Warning, MODULE, "Promiscuous", &format!("Physical interface '{}' is in promiscuous mode — possible sniffer", iface))
+                    .subject(&format!("promisc:{}", iface)),
+            );
         }
     }
 }
 
-fn raw_socket_check(tx: &Sender) {
-    progress(tx, "Checking for raw sockets...");
-
-    for (path, proto) in &[("/proc/net/raw", "IPv4"), ("/proc/net/raw6", "IPv6")] {
-        if let Ok(content) = fs::read_to_string(path) {
-            let mut suspicious_count = 0;
+fn raw_socket_check(tx: &Sender, owners: &HashMap<u64, (u32, String)>) {
+    progress(tx, "Checking for raw and packet sockets...");
+    for (path, proto) in [("/proc/net/raw", "IPv4"), ("/proc/net/raw6", "IPv6")] {
+        if let Some(content) = util::read_proc(path) {
             for line in content.lines().skip(1) {
-                if line.trim().is_empty() {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 10 {
                     continue;
                 }
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 4 {
-                    continue;
+                let protocol = f[1].rsplit(':').next().and_then(|p| u16::from_str_radix(p, 16).ok()).unwrap_or(0);
+                if protocol == 1 || protocol == 58 {
+                    continue; // ICMP/ICMPv6 (ping)
                 }
-                // Parse protocol number from local_address port field
-                let local = parts[1];
-                if let Some(colon) = local.rfind(':') {
-                    let port_hex = &local[colon+1..];
-                    let protocol = u16::from_str_radix(port_hex, 16).unwrap_or(0);
-                    // ICMPv4=1, ICMPv6=58 are normal system sockets — skip
-                    if protocol == 1 || protocol == 58 {
-                        continue;
-                    }
-                }
-                suspicious_count += 1;
+                let inode: u64 = f[9].parse().unwrap_or(0);
+                send(
+                    tx,
+                    Finding::new(
+                        Severity::Warning,
+                        MODULE,
+                        "Raw Socket",
+                        &format!("{} raw socket for protocol {} — sniffer/backdoor capable", proto, protocol),
+                    )
+                    .with_detail(&format!("Owner: {}", owner_str(owners, inode)))
+                    .subject(&format!("raw:{}:{}", proto, inode)),
+                );
             }
-            if suspicious_count > 0 {
-                send(tx, Finding::new(Severity::Warning, MODULE, "Raw Socket",
-                    &format!("{} non-ICMP {} raw socket(s) — possible sniffer/backdoor", suspicious_count, proto)));
+        }
+    }
+    // AF_PACKET sockets (tcpdump-style capture, BPFDoor uses these)
+    if let Some(content) = util::read_proc("/proc/net/packet") {
+        for line in content.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if let Some(inode) = f.last().and_then(|i| i.parse::<u64>().ok()) {
+                let owner = owner_str(owners, inode);
+                let benign = ["dhclient", "dhcpcd", "NetworkManager", "systemd-network", "wpa_supplicant", "lldpd", "tcpdump", "wireshark", "dumpcap"]
+                    .iter()
+                    .any(|b| owner.starts_with(b));
+                send(
+                    tx,
+                    Finding::new(
+                        if benign { Severity::Info } else { Severity::Warning },
+                        MODULE,
+                        "Raw Socket",
+                        &format!("AF_PACKET socket owned by {}", owner),
+                    )
+                    .with_detail("Packet sockets see all traffic; BPFDoor-style backdoors use them to wait for magic packets")
+                    .subject(&format!("packet:{}", inode)),
+                );
             }
         }
     }
 }
 
-fn ssh_authorized_keys(tx: &Sender) {
-    progress(tx, "Checking SSH authorized_keys...");
-
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-
-    let path = format!("{}/.ssh/authorized_keys", home);
-    if let Ok(content) = fs::read_to_string(&path) {
-        let keys: Vec<&str> = content.lines()
-            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
-            .collect();
-
-        if keys.is_empty() {
-            return;
-        }
-
-        send(tx, Finding::new(Severity::Info, MODULE, "SSH Keys",
-            &format!("{} authorized SSH key(s)", keys.len())));
-
-        for key in &keys {
-            if key.contains("command=") {
-                send(tx, Finding::new(Severity::Warning, MODULE, "SSH Forced Cmd",
-                    "authorized_keys entry with forced command")
-                    .with_detail(&truncate(key, 150)));
-            }
-            if key.contains("no-pty") && key.contains("command=") {
-                send(tx, Finding::new(Severity::Warning, MODULE, "SSH Tunnel Key",
-                    "Key configured for tunneling only (no-pty + command)")
-                    .with_detail(&truncate(key, 150)));
-            }
+fn load_feed(cfg: &ScanConfig) -> (Vec<netdiag::FeedEntry>, Option<String>) {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(f) = &cfg.feed {
+        paths.push(f.into());
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+        paths.push(dir.join("threat_feeds/c2_ips.txt"));
+        paths.push(dir.join("../threat_feeds/c2_ips.txt"));
+        paths.push(dir.join("../../threat_feeds/c2_ips.txt"));
+    }
+    paths.push("/etc/narayanastra/c2_ips.txt".into());
+    paths.push("/usr/share/narayanastra/c2_ips.txt".into());
+    paths.push("threat_feeds/c2_ips.txt".into());
+    for p in paths {
+        if let Some(c) = util::read_string_capped(&p, 32 * 1024 * 1024) {
+            return (netdiag::parse_feed(&c), Some(p.display().to_string()));
         }
     }
+    (Vec::new(), None)
 }
 
-fn threat_feed_check(tx: &Sender) {
-    progress(tx, "Matching connections against C2 threat feed...");
-
-    let mut threat_ips = std::collections::HashSet::new();
-    let feed_paths = [
-        "threat_feeds/c2_ips.txt",
-        "/usr/share/narayanastra/c2_ips.txt",
-    ];
-
-    let exe_dir = std::env::current_exe().ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-    let mut all_paths: Vec<std::path::PathBuf> = feed_paths.iter().map(std::path::PathBuf::from).collect();
-    if let Some(ref dir) = exe_dir {
-        all_paths.push(dir.join("../threat_feeds/c2_ips.txt"));
-    }
-
-    for path in &all_paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    threat_ips.insert(trimmed.to_string());
-                }
-            }
-            break;
-        }
-    }
-
-    if threat_ips.is_empty() {
-        send(tx, Finding::new(Severity::Info, MODULE, "Threat Feed",
-            "No threat feed loaded — skipping IP matching"));
+fn threat_feed_check(cfg: &ScanConfig, tx: &Sender, all: &[Conn], owners: &HashMap<u64, (u32, String)>) {
+    progress(tx, "Matching connections against the C2 threat feed (IPv4/IPv6/CIDR)...");
+    let (feed, path) = load_feed(cfg);
+    if feed.is_empty() {
+        send(tx, Finding::new(Severity::Info, MODULE, "Threat Feed", "No threat feed loaded — skipping IP matching").subject("feed"));
         return;
     }
-
-    send(tx, Finding::new(Severity::Info, MODULE, "Threat Feed",
-        &format!("Loaded {} known C2 IPs", threat_ips.len())));
-
-    let conns = parse_proc_net_tcp();
     let mut matched = 0;
-    for conn in &conns {
-        if threat_ips.contains(&conn.remote_ip) {
+    let mut seen = HashSet::new();
+    for c in all {
+        if netdiag::is_loopback_or_unspec(&c.remote) || !seen.insert((c.remote, c.rport)) {
+            continue;
+        }
+        if netdiag::feed_matches(&feed, &c.remote) {
             matched += 1;
-            send(tx, Finding::new(Severity::Danger, MODULE, "C2 Match",
-                &format!("Connection to known C2: {}:{}", conn.remote_ip, conn.remote_port))
-                .with_detail(&format!("Local port: {}, State: {}", conn.local_port, conn.state)));
+            send(
+                tx,
+                Finding::new(Severity::Danger, MODULE, "C2 Match", &format!("{} connection to known C2 {}:{}", c.proto, c.remote, c.rport))
+                    .with_detail(&format!("Local port: {}\nProcess: {}", c.lport, owner_str(owners, c.inode)))
+                    .subject(&format!("c2:{}:{}", c.remote, c.rport)),
+            );
         }
     }
-
     if matched == 0 {
-        send(tx, Finding::new(Severity::Safe, MODULE, "C2 Check",
-            &format!("No connections to known C2 IPs ({} checked)", conns.len())));
+        send(
+            tx,
+            Finding::new(Severity::Safe, MODULE, "C2 Check", &format!("No connections to {} feed entries ({})", feed.len(), path.unwrap_or_default()))
+                .subject("c2"),
+        );
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max { format!("{}...", &s[..max]) } else { s.to_string() }
-}
-
-pub fn scan(tx: Sender) {
+pub fn scan(cfg: &ScanConfig, tx: Sender) {
     let start = Instant::now();
     let _ = tx.send(ScanEvent::ModuleStart(MODULE.to_string()));
+    let proc_view = netdiag::proc_net_all();
+    let nl_view = netdiag::netlink_all();
+    let owners = procfs::socket_owner_map();
+    let mut all = proc_view.clone();
+    if let Some(nl) = &nl_view {
+        let have: HashSet<_> = all.iter().map(|c| (c.proto, c.v6, c.lport, c.inode)).collect();
+        all.extend(nl.iter().filter(|c| !have.contains(&(c.proto, c.v6, c.lport, c.inode))).cloned());
+    }
 
-    ss_vs_proc_compare(&tx);
-    deep_listening_scan(&tx);
-    outbound_analysis(&tx);
+    cross_view(&tx, &proc_view, nl_view.as_ref(), &owners);
+    if cfg.full {
+        bind_probe(cfg, &tx, &all);
+    }
+    listening_analysis(&tx, &all, &owners);
+    outbound_analysis(&tx, &all, &owners);
     promiscuous_check(&tx);
-    raw_socket_check(&tx);
-    ssh_authorized_keys(&tx);
-    threat_feed_check(&tx);
-
+    raw_socket_check(&tx, &owners);
+    threat_feed_check(cfg, &tx, &all, &owners);
     let _ = tx.send(ScanEvent::ModuleDone(MODULE.to_string(), start.elapsed()));
 }
