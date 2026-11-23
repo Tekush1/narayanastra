@@ -2,6 +2,7 @@
   <h1 align="center">Narayanastra</h1>
   <p align="center"><strong>Post-Compromise Rootkit &amp; Backdoor Scanner for Linux</strong></p>
   <p align="center">
+    <a href="#quick-start">Quick start</a> •
     <a href="#installation">Installation</a> •
     <a href="#usage">Usage</a> •
     <a href="#modules">Modules</a> •
@@ -19,9 +20,31 @@
 
 ---
 
-**Narayanastra** is a post-compromise scanner that hunts rootkits, backdoors and silent persistence on systems that may already be owned. It is written in Rust, runs 12 detection modules in parallel with live streaming output, and was built on one rule: **never trust the host you are scanning**.
+### Is your Linux server already hacked? Find out with one command.
 
-## Why Narayanastra?
+When attackers break into a Linux machine, the first thing they do is **hide**. Their processes, files, network connections and kernel modules become invisible to everyday tools like `ps`, `ls`, `netstat` and most antivirus software, because those tools ask the system what's running, and a rootkit controls that answer.
+
+Narayanastra asks the system the same question **in two independent ways** and compares the answers. If they don't match, something is hiding, and Narayanastra shows you what, where and how serious it is.
+
+- **Nothing to install.** One file, no agent, no setup. Download it, run it, done.
+- **Clear answers.** Every finding is marked Danger / Warning / Info, with the evidence behind it.
+- **Works after the fact.** Scan a powered-off disk image where the malware can't fight back.
+- **Free and open source.** MIT licensed.
+
+**Who is it for?** Sysadmins and small teams who suspect a server was compromised, incident responders, blue teams, students and CTF players learning how real Linux malware hides.
+
+## Quick start
+
+```bash
+# download the static binary from Releases, then:
+chmod +x narayanastra-linux-x86_64
+sudo ./narayanastra-linux-x86_64          # quick scan
+sudo ./narayanastra-linux-x86_64 --full   # deep scan
+```
+
+Exit code `0` means clean, `1` means warnings, `2` means danger found, `3` means the scan could not finish. Reports are written as text and JSON (HTML, SARIF and NDJSON on request).
+
+## Technical highlights
 
 - **Cross-view detection** — compares what the kernel *does* (syscall probes, `bind()`, netlink) with what it *reports* (`/proc`, module lists). Hidden processes, sockets, modules and eBPF programs show up as disagreements.
 - **Doesn't trust the compromised host** — no shelling out to `ps`/`ss`/`find`; `/proc` is listed with raw `getdents64` syscalls (immune to `LD_PRELOAD` readdir hooks); the few external tools it still uses (dpkg, rpm, journalctl…) run by absolute path, only if root-owned, with a clean environment.
