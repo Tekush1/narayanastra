@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn truncate_multibyte_does_not_panic() {
-        let s = "नारायणास्त्र 🔥 rootkit";
+        let s = "हिंदी टेक्स्ट 🔥 rootkit";
         let t = truncate(s, 5);
         assert!(t.ends_with("..."));
         assert_eq!(truncate("abc", 10), "abc");

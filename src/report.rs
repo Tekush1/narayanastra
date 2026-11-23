@@ -429,7 +429,7 @@ pre{margin:4px 0 0;white-space:pre-wrap;color:var(--muted);font:12px/1.4 ui-mono
 </style></head><body>",
         );
         h.push_str(&format!(
-            "<header><h1>नारायणास्त्र — Narayanastra v{}</h1><p>{} · {} · {} mode · {:.1}s</p></header><main>",
+            "<header><h1>Narayanastra v{}</h1><p>{} · {} · {} mode · {:.1}s</p></header><main>",
             esc(&self.version),
             esc(&self.hostname),
             esc(&self.timestamp),

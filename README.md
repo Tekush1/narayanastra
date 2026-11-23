@@ -1,6 +1,6 @@
 <p align="center">
-  <h1 align="center">नारायणास्त्र — Narayanastra</h1>
-  <p align="center"><strong>Vishnu's Ultimate Weapon Against Silent Compromise</strong></p>
+  <h1 align="center">Narayanastra</h1>
+  <p align="center"><strong>Post-Compromise Rootkit &amp; Backdoor Scanner for Linux</strong></p>
   <p align="center">
     <a href="#installation">Installation</a> •
     <a href="#usage">Usage</a> •
@@ -20,8 +20,6 @@
 ---
 
 **Narayanastra** is a post-compromise scanner that hunts rootkits, backdoors and silent persistence on systems that may already be owned. It is written in Rust, runs 12 detection modules in parallel with live streaming output, and was built on one rule: **never trust the host you are scanning**.
-
-> *In Hindu mythology, the Narayanastra is Lord Vishnu's unstoppable divine weapon — the more you resist, the more powerful it becomes. A rootkit that hides only makes Narayanastra hunt harder.*
 
 ## Why Narayanastra?
 
@@ -218,5 +216,5 @@ MIT License — see [LICENSE](LICENSE)
 ---
 
 <p align="center">
-  <em>जितना छुपेगा, उतना ढूंढेगा — The more it hides, the harder it hunts.</em>
+  <em>The more it hides, the harder it hunts.</em>
 </p>

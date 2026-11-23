@@ -32,7 +32,7 @@ use std::time::Instant;
 #[command(
     name = "narayanastra",
     version,
-    about = "नारायणास्त्र — post-compromise scanner for rootkits, backdoors and silent threats",
+    about = "Narayanastra — post-compromise scanner for rootkits, backdoors and silent threats",
     after_help = "Examples:\n  narayanastra                               quick scan\n  sudo narayanastra --full                   full deep scan\n  sudo narayanastra -f --watch 60            full scan, re-scan every 60s\n  sudo narayanastra --offline /mnt/disk      offline forensic scan\n  sudo narayanastra --container web1         scan a container's filesystem\n  narayanastra --remote ubuntu@host -f       scan a server over SSH\n  sudo narayanastra --format html,sarif      extra report formats\n  sudo narayanastra baseline save base.json --key-file k\n  sudo narayanastra baseline diff base.json --key-file k\n  narayanastra crossdiff --live live.json --offline disk.json"
 )]
 struct Cli {
@@ -136,8 +136,8 @@ fn print_banner() {
     c("║   ██║ ╚████║██║  ██║██║  ██║██║  ██║   ██║   ██║  ██║██║ ╚████║      ║");
     c("║   ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝      ║");
     c("║                         A S T R A                                    ║");
-    c("║   नारायणास्त्र — Vishnu's Ultimate Weapon                              ║");
-    c(&format!("║   v{:<8} | Post-Compromise Deep Scanner | CyberHX                 ║", report::VERSION));
+    c("║   Post-Compromise Rootkit & Backdoor Scanner                         ║");
+    c(&format!("║   v{:<8} | CyberHX                                                ║", report::VERSION));
     c("║   Built by Kushagra Dwivedi                                          ║");
     c("╚══════════════════════════════════════════════════════════════════════╝");
     println!();
@@ -361,7 +361,7 @@ fn send_webhook(url: &str, dangers: &[&Finding], host: &str) {
         return;
     }
     let lines: Vec<String> = dangers.iter().take(20).map(|f| format!("• [{}] {}", f.module, f.message)).collect();
-    let text = format!("🔱 Narayanastra on {}: {} DANGER finding(s)\n{}", host, dangers.len(), lines.join("\n"));
+    let text = format!("Narayanastra on {}: {} DANGER finding(s)\n{}", host, dangers.len(), lines.join("\n"));
     let body = serde_json::json!({"text": text, "content": text}).to_string();
     #[cfg(target_os = "linux")]
     {
