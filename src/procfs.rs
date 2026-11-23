@@ -224,7 +224,9 @@ pub fn parse_container_id(cgroup: &str) -> Option<String> {
 }
 
 pub fn ns_inode(pid: u32, ns: &str) -> Option<String> {
-    fs::read_link(format!("/proc/{}/ns/{}", pid, ns)).ok().map(|p| p.to_string_lossy().into_owned())
+    // Unreadable namespaces normally fail with EACCES; never let an empty value through,
+    // because two empty strings would "match" and fake a shared namespace.
+    fs::read_link(format!("/proc/{}/ns/{}", pid, ns)).ok().map(|p| p.to_string_lossy().into_owned()).filter(|s| s.contains(":["))
 }
 
 #[cfg(test)]

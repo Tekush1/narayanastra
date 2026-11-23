@@ -27,9 +27,36 @@ pub fn scan(_cfg: &ScanConfig, tx: Sender) {
     let _ = tx.send(ScanEvent::ModuleStart(MODULE.to_string()));
     progress(&tx, "Mapping processes to containers and checking escape paths...");
 
-    let host_net = procfs::ns_inode(1, "net");
-    let host_pid = procfs::ns_inode(1, "pid");
-    let host_mnt = procfs::ns_inode(1, "mnt");
+    // If Narayanastra itself runs inside a container (devcontainer, Codespaces, a docker
+    // run, WSL distro on Docker Desktop...), PID 1 is that container's init, not the host.
+    // Comparing against it would report every process as "sharing the host namespace".
+    let self_container = procfs::container_of(std::process::id());
+    let pid1_container = procfs::container_of(1);
+    let inside = scanner_inside_container(
+        self_container.is_some(),
+        pid1_container.is_some(),
+        std::path::Path::new("/.dockerenv").exists() || std::path::Path::new("/run/.containerenv").exists(),
+    );
+    if inside {
+        send(
+            &tx,
+            Finding::new(
+                Severity::Info,
+                MODULE,
+                "Containers",
+                &format!(
+                    "Scanner is running inside a container ({}) — host namespace checks skipped",
+                    self_container.clone().or(pid1_container.clone()).unwrap_or_else(|| "unknown".into())
+                ),
+            )
+            .with_detail("Run Narayanastra on the host to check container escapes")
+            .subject("inside"),
+        );
+    }
+    let host_ns = |ns: &str| if inside { None } else { procfs::ns_inode(1, ns) };
+    let host_net = host_ns("net");
+    let host_pid = host_ns("pid");
+    let host_mnt = host_ns("mnt");
     // major:minor of the host's root filesystem
     let host_root_dev: Option<String> = util::read_proc("/proc/1/mountinfo").and_then(|mi| {
         mi.lines().find_map(|l| {
@@ -49,6 +76,10 @@ pub fn scan(_cfg: &ScanConfig, tx: Sender) {
     }
     let mut reported: HashSet<(String, &str)> = HashSet::new();
     for (id, pids) in &containers {
+        // our own container is the environment we run in, not a target
+        if Some(id) == self_container.as_ref() || Some(id) == pid1_container.as_ref() {
+            continue;
+        }
         for pid in pids {
             let st = procfs::status_fields(*pid);
             let eff = caps(st.get("CapEff").map(|s| s.as_str()).unwrap_or("0"));
@@ -134,4 +165,28 @@ pub fn scan(_cfg: &ScanConfig, tx: Sender) {
             .subject("inventory"),
     );
     let _ = tx.send(ScanEvent::ModuleDone(MODULE.to_string(), start.elapsed()));
+}
+
+/// The host's namespaces are only visible when neither we nor PID 1 live in a container.
+pub fn scanner_inside_container(self_in_container: bool, pid1_in_container: bool, marker_file: bool) -> bool {
+    self_in_container || pid1_in_container || marker_file
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inside_container_detection() {
+        assert!(!scanner_inside_container(false, false, false));
+        assert!(scanner_inside_container(true, false, false));
+        assert!(scanner_inside_container(false, true, false));
+        assert!(scanner_inside_container(false, false, true));
+    }
+
+    #[test]
+    fn caps_parsing() {
+        assert_eq!(caps("000001ffffffffff").count_ones(), 41);
+        assert_eq!(caps("00000000a80425fb") & (1 << CAP_SYS_ADMIN), 0);
+    }
 }
