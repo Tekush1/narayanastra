@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/language-Rust-orange?style=flat-square" />
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-blue?style=flat-square" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" />
-  <img src="https://img.shields.io/badge/version-2.0.0-cyan?style=flat-square" />
+  <img src="https://img.shields.io/badge/version-2.0.1-cyan?style=flat-square" />
 </p>
 
 ---
