@@ -2,6 +2,7 @@ mod config;
 #[cfg(target_os = "linux")]
 mod hash;
 mod logo;
+mod menu;
 mod modules;
 mod report;
 
@@ -21,6 +22,7 @@ use colored::*;
 use config::ScanConfig;
 use report::{Finding, Format, ScanEvent, ScanReport, Severity};
 use std::collections::HashSet;
+use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -127,7 +129,7 @@ enum BaselineCmd {
     },
 }
 
-fn print_banner() {
+fn print_banner() -> usize {
     let (art, width) = logo::lines(4);
     let centre = |text: &str| " ".repeat(width.saturating_sub(text.chars().count()) / 2);
     println!();
@@ -140,6 +142,7 @@ fn print_banner() {
     println!("  {}{}", centre(tagline), tagline.bold());
     println!("  {}{}", centre(&credit), credit.dimmed());
     println!();
+    width
 }
 
 #[cfg(unix)]
@@ -385,9 +388,19 @@ fn parse_formats(v: &[String]) -> Result<Vec<Format>, String> {
 
 fn main() {
     let cli = Cli::parse();
-    let opts = cli.opts.clone();
+    let mut opts = cli.opts.clone();
     if opts.no_color {
         colored::control::set_override(false);
+    }
+    // No options and a person at the keyboard: offer the start menu.
+    let interactive = std::env::args_os().len() == 1 && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if interactive {
+        let width = print_banner();
+        if !menu::run(&mut opts, width) {
+            std::process::exit(0);
+        }
+    } else if !opts.quiet {
+        print_banner();
     }
     let formats = match parse_formats(&opts.format) {
         Ok(f) => f,
@@ -396,9 +409,6 @@ fn main() {
             std::process::exit(3);
         }
     };
-    if !opts.quiet {
-        print_banner();
-    }
     let root = is_root();
     let cfg = Arc::new(ScanConfig { is_root: root, full: opts.full, hashdb: opts.hashdb.clone(), feed: opts.feed.clone() });
 
