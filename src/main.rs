@@ -1,6 +1,7 @@
 mod config;
 #[cfg(target_os = "linux")]
 mod hash;
+mod logo;
 mod modules;
 mod report;
 
@@ -127,19 +128,17 @@ enum BaselineCmd {
 }
 
 fn print_banner() {
-    let c = |s: &str| println!("{}", s.cyan());
-    c("╔══════════════════════════════════════════════════════════════════════╗");
-    c("║   ███╗   ██╗ █████╗ ██████╗  █████╗ ██╗   ██╗ █████╗ ███╗   ██╗      ║");
-    c("║   ████╗  ██║██╔══██╗██╔══██╗██╔══██╗╚██╗ ██╔╝██╔══██╗████╗  ██║      ║");
-    c("║   ██╔██╗ ██║███████║██████╔╝███████║ ╚████╔╝ ███████║██╔██╗ ██║      ║");
-    c("║   ██║╚██╗██║██╔══██║██╔══██╗██╔══██║  ╚██╔╝  ██╔══██║██║╚██╗██║      ║");
-    c("║   ██║ ╚████║██║  ██║██║  ██║██║  ██║   ██║   ██║  ██║██║ ╚████║      ║");
-    c("║   ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝      ║");
-    c("║                         A S T R A                                    ║");
-    c("║   Post-Compromise Rootkit & Backdoor Scanner                         ║");
-    c(&format!("║   v{:<8} | CyberHX                                                ║", report::VERSION));
-    c("║   Built by Kushagra Dwivedi                                          ║");
-    c("╚══════════════════════════════════════════════════════════════════════╝");
+    let (art, width) = logo::lines(4);
+    let centre = |text: &str| " ".repeat(width.saturating_sub(text.chars().count()) / 2);
+    println!();
+    for line in art {
+        println!("  {}", line);
+    }
+    let tagline = "Post-Compromise Rootkit & Backdoor Scanner";
+    let credit = format!("v{} | CyberHX | Built by Kushagra Dwivedi", report::VERSION);
+    println!();
+    println!("  {}{}", centre(tagline), tagline.bold());
+    println!("  {}{}", centre(&credit), credit.dimmed());
     println!();
 }
 

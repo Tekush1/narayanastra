@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">Narayanastra</h1>
+  <p align="center"><img src="assets/logo.png" alt="Narayanastra logo" width="420"></p>
   <p align="center"><strong>Post-Compromise Rootkit &amp; Backdoor Scanner for Linux</strong></p>
   <p align="center">
     <a href="#quick-start">Quick start</a> •
